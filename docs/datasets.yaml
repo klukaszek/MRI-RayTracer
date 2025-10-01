@@ -1,0 +1,66 @@
+# Dataset manifest for Option B (1920x1080 evaluation)
+# Document provenance, license, preprocessing, and splits.
+
+version: 1
+resolution: [1920, 1080]
+volumes:
+  - name: bonsai
+    source: classic_volume_dataset
+    provenance: Stanford/VolVis archive (common academic redistribution)
+    license: research-use only (verify local copy license)
+    target_resolution: [256, 256, 256]
+    preprocessing:
+      - normalize_density: unit_range
+      - resample: [256, 256, 256]
+      - clamp_bounds: [0.0, 1.0]
+    splits:
+      train_views: 6
+      test_views: 2
+
+  - name: openvdb_clouds
+    source: openvdb_samples
+    provenance: OpenVDB sample pack / community assets (license permitting)
+    license: check asset-specific license
+    target_resolution: [256, 256, 256]
+    preprocessing:
+      - normalize_density: unit_range
+      - convert: openvdb_to_dense
+      - resample: [256, 256, 256]
+    splits:
+      train_views: 6
+      test_views: 2
+
+  - name: noise_perlin
+    source: procedural
+    provenance: generated via deterministic Perlin noise (seeded)
+    license: generated (no restrictions)
+    target_resolution: [256, 256, 256]
+    preprocessing:
+      - generate_noise: {type: perlin, octaves: 4, seed: 1337}
+      - normalize_density: unit_range
+    splits:
+      train_views: 6
+      test_views: 2
+
+point_clouds:
+  - name: modelnet40_sampled
+    source: ModelNet40
+    provenance: mesh → poisson disk sampling
+    license: ModelNet40 terms (research use)
+    preprocessing:
+      - sample_points: {count: 100k}
+      - normalize_unit_cube: true
+    splits:
+      train_views: 5
+      test_views: 2
+
+  - name: kitti_lidar_subset
+    source: KITTI
+    provenance: raw Velodyne frames (subset)
+    license: KITTI terms (research use)
+    preprocessing:
+      - downsample_voxel: {size: 0.05}
+      - normalize_unit_cube: true
+    splits:
+      train_views: 5
+      test_views: 2
