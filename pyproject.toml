@@ -1,5 +1,5 @@
 [project]
-name = "CIS6020 MRI-Raytracer"
+name = "CIS6020"
 version = "0.1.0"
 description = "CIS6020 Group Project"
 readme = "README.md"
