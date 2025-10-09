@@ -1,1 +1,13 @@
 .hidden/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+# uv caches
+.uv/
+uv.lock
+# editor junk
+.vscode/
+.idea/

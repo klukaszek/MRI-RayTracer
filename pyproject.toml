@@ -3,7 +3,7 @@ name = "CIS6020"
 version = "0.1.0"
 description = "CIS6020 Group Project"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "ipykernel>=6.30.1",
     "ipympl>=0.9.8",
@@ -12,6 +12,7 @@ dependencies = [
     "jupyterlab-widgets>=3.0.15",
     "matplotlib>=3.10.7",
     "numpy>=2.3.3",
+    "pyyaml>=6.0.2",
     "pandas>=2.3.3",
     "scikit-learn>=1.7.2",
     "scipy>=1.16.2",
@@ -24,16 +25,35 @@ cpu = [
   "torch>=2.7.0",
   "torchvision>=0.22.0",
 ]
+cu128 = [
+  "torch>=2.7.0",
+  "torchvision>=0.22.0",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cu128" },
+  ],
+]
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cpu",   extra = "cpu" },
+  { index = "pytorch-cu128", extra = "cu128" },
 ]
 torchvision = [
-  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cpu",   extra = "cpu" },
+  { index = "pytorch-cu128", extra = "cu128" },
 ]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
