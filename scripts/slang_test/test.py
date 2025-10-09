@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import slangpy as spy
+import torch
 from pathlib import Path
 
 EXAMPLE_DIR = Path(__file__).parent
 
+x = torch.rand(5, 3)
+print(x)
 
 class App:
     def __init__(self):
