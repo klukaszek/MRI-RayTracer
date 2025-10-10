@@ -4,9 +4,9 @@ import math
 from pathlib import Path
 import numpy as np
 import slangpy as spy
+from camera import OrbitalCamera
 
 HERE = Path(__file__).parent
-
 
 # No MLP needed for analytic SDF sphere
 
@@ -52,7 +52,7 @@ class App:
         self.output_texture = None
 
         # Load shader
-        program = self.device.load_program("neural_raymarch.slang", ["neural_raymarch_cs"])
+        program = self.device.load_program("raymarch.slang", ["raymarch_cs"])
         self.kernel = self.device.create_compute_kernel(program)
 
         # No MLP buffers; shader renders analytic sphere
@@ -61,10 +61,23 @@ class App:
         self.frame = 0
         self.fps_avg = 0.0
 
-        # Camera params
+        # Initial camera (yaw/pitch/radius mapped to orbital theta/phi)
         self.yaw_deg = 25.0
         self.pitch_deg = -10.0
         self.radius = 2.0
+        self.target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        initial_phi = max(0.01, min(math.pi - 0.01, math.pi * 0.5 - math.radians(self.pitch_deg)))
+        initial_theta = math.radians(self.yaw_deg)
+        self.camera = OrbitalCamera(
+            initial_target=self.target,
+            initial_radius=self.radius,
+            initial_phi=initial_phi,
+            initial_theta=initial_theta,
+            min_radius=0.1,
+            max_radius=50.0,
+            min_phi=0.01,
+            max_phi=math.pi - 0.01,
+        )
 
         # Shader params
         self.fov_deg = 45.0
@@ -79,19 +92,37 @@ class App:
 
         # Events
         self.window.on_keyboard_event = self.on_keyboard_event
-        # Forward mouse to UI (no camera controls)
         self.window.on_mouse_event = self.on_mouse_event
         self.window.on_resize = self.on_resize
 
+        # Mouse/keyboard interaction state (for optional pan/zoom)
+        self.shift_down = False
+        self.lmb_pressed = False
+        self.rmb_pressed = False
+        self.last_mouse_pos = spy.float2(0.0, 0.0)
+        # Pan drag state
+        self.pan_dragging = False
+        self.pan_press_pos = spy.float2(0.0, 0.0)
+        self.drag_deadzone_px = 6.0
+        # Build a set of shift key codes that exist in this build
+        self._shift_keys = set()
+        for _name in ("shift", "left_shift", "right_shift"):
+            kc = getattr(spy.KeyCode, _name, None)
+            if kc is not None:
+                self._shift_keys.add(kc)
+
     def setup_ui(self):
         screen = self.ui.screen
-        window = spy.ui.Window(screen, "Neural Raymarch Settings", size=spy.float2(360, 220))
+        window = spy.ui.Window(screen, "Neural Raymarch Settings", size=spy.float2(380, 260))
         self.fps_text = spy.ui.Text(window, "FPS: 0")
-
-        spy.ui.Text(window, "Camera")
+        spy.ui.Text(window, "Camera (Yaw/Pitch/Radius)")
         self.yaw_slider = spy.ui.SliderFloat(window, "Yaw (deg)", value=self.yaw_deg, min=-180.0, max=180.0)
         self.pitch_slider = spy.ui.SliderFloat(window, "Pitch (deg)", value=self.pitch_deg, min=-80.0, max=80.0)
         self.radius_slider = spy.ui.SliderFloat(window, "Distance", value=self.radius, min=0.5, max=10.0)
+        spy.ui.Text(window, "Controls: Enable Pan, then Shift+LMB drag.\nWheel/Right-drag = Zoom")
+        self.pan_enable = spy.ui.CheckBox(window, "Enable Pan", value=False)
+
+        # No animation/effects controls per request
 
         spy.ui.Text(window, "Shader")
         self.fov_slider = spy.ui.SliderFloat(window, "FOV Y (deg)", value=self.fov_deg, min=20.0, max=90.0)
@@ -101,15 +132,77 @@ class App:
         self.normeps_slider = spy.ui.SliderFloat(window, "Normal Eps", value=self.normal_eps, min=1e-5, max=5e-2)
 
     def on_keyboard_event(self, event: spy.KeyboardEvent):
+        # Track Shift state regardless of whether UI consumes the event
+        if event.type == spy.KeyboardEventType.key_press:
+            if event.key in self._shift_keys:
+                self.shift_down = True
+        elif event.type == spy.KeyboardEventType.key_release:
+            if event.key in self._shift_keys:
+                self.shift_down = False
+
         if self.ui.handle_keyboard_event(event):
             return
+
         if event.type == spy.KeyboardEventType.key_press:
             if event.key == spy.KeyCode.escape:
                 self.window.close()
 
-    # Mouse orbit/zoom removed; forward to UI only
     def on_mouse_event(self, event: spy.MouseEvent):
-        self.ui.handle_mouse_event(event)
+        if self.ui.handle_mouse_event(event):
+            return
+
+        # Scroll wheel zoom using slangpy MouseEvent.is_scroll() and .scroll
+        try:
+            if event.is_scroll():
+                sy = float(event.scroll.y)
+                # Use exponential scaling for smooth zoom
+                zoom_factor = pow(1.15, -sy)
+                zoom_factor = max(0.5, min(2.0, zoom_factor))
+                self.camera.zoom(zoom_factor)
+                self.radius_slider.value = float(self.camera.radius)
+                return
+        except Exception:
+            pass
+
+        # Button presses
+        if event.type == spy.MouseEventType.button_down:
+            if event.button == spy.MouseButton.left:
+                self.lmb_pressed = True
+                self.last_mouse_pos = event.pos
+                self.pan_press_pos = event.pos
+                self.pan_dragging = False
+            elif event.button == spy.MouseButton.right:
+                self.rmb_pressed = True
+                self.last_mouse_pos = event.pos
+        elif event.type == spy.MouseEventType.button_up:
+            if event.button == spy.MouseButton.left:
+                self.lmb_pressed = False
+                self.pan_dragging = False
+            elif event.button == spy.MouseButton.right:
+                self.rmb_pressed = False
+        elif event.type == spy.MouseEventType.move:
+            # Pan when enabled (Shift+LMB drag)
+            if self.lmb_pressed and self.pan_enable.value and self.shift_down:
+                if not self.pan_dragging:
+                    pdx = float(event.pos.x - self.pan_press_pos.x)
+                    pdy = float(event.pos.y - self.pan_press_pos.y)
+                    if (pdx*pdx + pdy*pdy) >= (self.drag_deadzone_px * self.drag_deadzone_px):
+                        self.pan_dragging = True
+                        # Reset last reference to current to avoid a jump on activation
+                        self.last_mouse_pos = event.pos
+                else:
+                    dx = float(event.pos.x - self.last_mouse_pos.x)
+                    dy = float(event.pos.y - self.last_mouse_pos.y)
+                    self.camera.pan(dx, dy)
+            # Zoom with right-drag vertical
+            if self.rmb_pressed:
+                dy = float(event.pos.y - self.last_mouse_pos.y)
+                h = max(1.0, float(self.window.height))
+                zoom_factor = 1.0 + (-dy / h) * 2.0
+                zoom_factor = max(0.5, min(2.0, zoom_factor))
+                self.camera.zoom(zoom_factor)
+                self.radius_slider.value = float(self.camera.radius)
+            self.last_mouse_pos = event.pos
 
     def on_resize(self, width: int, height: int):
         self.device.wait()
@@ -150,9 +243,13 @@ class App:
                 )
 
             # Update UI-driven params
-            self.yaw_deg = self.yaw_slider.value
-            self.pitch_deg = self.pitch_slider.value
-            self.radius = self.radius_slider.value
+            # Camera from yaw/pitch/radius via orbital mapping
+            self.yaw_deg = float(self.yaw_slider.value)
+            self.pitch_deg = float(self.pitch_slider.value)
+            self.radius = max(0.1, float(self.radius_slider.value))
+            self.camera.theta = math.radians(self.yaw_deg)
+            self.camera.phi = max(self.camera.min_phi, min(self.camera.max_phi, math.pi * 0.5 - math.radians(self.pitch_deg)))
+            self.camera.radius = max(self.camera.min_radius, min(self.camera.max_radius, self.radius))
             self.fov_deg = self.fov_slider.value
             self.max_steps = int(self.steps_slider.value)
             self.max_distance = self.maxdist_slider.value
@@ -160,11 +257,10 @@ class App:
             self.normal_eps = self.normeps_slider.value
             # No MLP params
 
-            view_to_world = look_at_view_to_world(self.yaw_deg, self.pitch_deg, self.radius)
-            eye = view_to_world[3, 0:3]
-            gU = view_to_world[0, 0:3]
-            gV = view_to_world[1, 0:3]
-            gW = view_to_world[2, 0:3]
+            # Build basis from orbital camera
+            eye, gU, gV, gW = self.camera.get_basis()
+            # Keep UI sliders in sync with camera radius after zoom/pan
+            self.radius_slider.value = float(self.camera.radius)
 
             params = {
                 "imageSize": (np.uint32(self.output_texture.width), np.uint32(self.output_texture.height)),

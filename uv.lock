@@ -342,11 +342,11 @@ wheels = [
 
 [[package]]
 name = "dol"
-version = "0.3.20"
+version = "0.3.22"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/d7/53/f4352c21001dac0d84ec76860376cc5193643c8547a437eba990d2199250/dol-0.3.20.tar.gz", hash = "sha256:3ee6c28bec31323c95190ddb1274d3e5b059fc0f9d6812411880141afa7aca94", size = 247905, upload-time = "2025-09-08T12:42:36.395Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0c/1e/1e49ac5d77bf6d637dd57b8a96409d074cee118d782a4ab49e6b9807df74/dol-0.3.22.tar.gz", hash = "sha256:5576dcbee642bdca334c883ede578d67457587e0322cdbd9277c2d783878b3fb", size = 255572, upload-time = "2025-10-10T03:37:32.215Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/8e/1cc3f0ff4f974189f621041bca35ac37d56308ccdb98bd4c2baf932be356/dol-0.3.20-py3-none-any.whl", hash = "sha256:9725d3af9333a895f8380a8b5975aa9898fe0ede71d87f100a34198e62b10947", size = 256051, upload-time = "2025-09-08T12:42:34.157Z" },
+    { url = "https://files.pythonhosted.org/packages/72/c5/c31fd2611559ae1333e0e5d872fdfabf3a6d3ebf542285f166bf74c7336a/dol-0.3.22-py3-none-any.whl", hash = "sha256:4c5960babe910bfbc8d9d33388172512c3fc837cccbd327b96de49c5c8b5fb09", size = 264808, upload-time = "2025-10-10T03:37:30.419Z" },
 ]
 
 [[package]]

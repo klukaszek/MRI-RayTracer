@@ -59,7 +59,7 @@ Ray makePrimary(uint2 pixel, uint2 dims)
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void neural_raymarch_cs(uint3 tid : SV_DispatchThreadID)
+void raymarch_cs(uint3 tid : SV_DispatchThreadID)
 {
     uint2 dims; render_texture.GetDimensions(dims.x, dims.y);
     if (any(tid.xy >= dims)) return;
