@@ -252,7 +252,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.7.2" },
     { name = "scipy", specifier = ">=1.16.2" },
     { name = "slang", specifier = ">=0.1.12" },
-    { name = "slangpy", specifier = ">=0.36.0" },
+    { name = "slangpy", git = "https://github.com/shader-slang/slangpy" },
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "cis6020", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cu128'", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "cis6020", extra = "cu128" } },
     { name = "torchvision", marker = "extra == 'cpu'", specifier = ">=0.22.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "cis6020", extra = "cpu" } },
@@ -1610,16 +1610,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/3f/c5/1812a2f0fbabdbb49
 
 [[package]]
 name = "slangpy"
-version = "0.36.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.37.0"
+source = { git = "https://github.com/shader-slang/slangpy#f3713592d60d9884810f83612edfcfb333c193a9" }
 dependencies = [
     { name = "numpy" },
     { name = "typing-extensions" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/40/b1/102f5111e795187bebeacecd5aabe5f4d2aee5db28a21f3ed5b7c26b828b/slangpy-0.36.0-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:f34d9837a776a6401b170e371c73dbc881c65e5ef6e636541f3be334044f3399", size = 33944176, upload-time = "2025-09-30T09:55:57.167Z" },
-    { url = "https://files.pythonhosted.org/packages/52/71/d2fb77ec8fdfedd5579338de7df64e4db73963e969e2bb8dda4d4d124a79/slangpy-0.36.0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:650261f3c9707a467581462410b14fece42377ce3f4a5bb7edecd16fee4bbf68", size = 74416794, upload-time = "2025-09-30T09:56:01.547Z" },
-    { url = "https://files.pythonhosted.org/packages/f1/9e/06bb167748ba2eea906e736de1a89915b7cfefec352ae7ec8091ad831719/slangpy-0.36.0-cp312-cp312-win_amd64.whl", hash = "sha256:2ffc3277a50ba936093f9024d6112d449a54fb2120e2d27b658e4195a4059135", size = 63796399, upload-time = "2025-09-30T09:56:06.408Z" },
 ]
 
 [[package]]
