@@ -318,12 +318,12 @@ class App:
             cmd.blit(surface_tex, self.output_texture)
 
             # UI after blit so it overlays
-            self.ui.begin_frame(surface_tex.width, surface_tex.height)
+            self.ui.new_frame(surface_tex.width, surface_tex.height)
             try:
                 self.status.text = f"FPS: {fps_avg:.2f} | {self.status_text}"
             except Exception:
                 pass
-            self.ui.end_frame(surface_tex, cmd)
+            self.ui.render(surface_tex, cmd)
 
             # Present
             self.device.submit_command_buffer(cmd.finish())

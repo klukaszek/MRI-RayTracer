@@ -252,7 +252,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.7.2" },
     { name = "scipy", specifier = ">=1.16.2" },
     { name = "slang", specifier = ">=0.1.12" },
-    { name = "slangpy", git = "https://github.com/shader-slang/slangpy" },
+    { name = "slangpy" },
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "cis6020", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cu128'", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "cis6020", extra = "cu128" } },
     { name = "torchvision", marker = "extra == 'cpu'", specifier = ">=0.22.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "cis6020", extra = "cpu" } },
@@ -1611,10 +1611,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/3f/c5/1812a2f0fbabdbb49
 [[package]]
 name = "slangpy"
 version = "0.37.0"
-source = { git = "https://github.com/shader-slang/slangpy#f3713592d60d9884810f83612edfcfb333c193a9" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "typing-extensions" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f9/b8/ffd564f0601d566912d54150e391a89742b0b0022a8dc4def4c3f610333f/slangpy-0.37.0-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:4bf0fbe27a92af8118ca2d449081014c384184078137602b61c841e1c5c063f4", size = 34010344, upload-time = "2025-10-15T16:19:57.051Z" },
+    { url = "https://files.pythonhosted.org/packages/28/c5/c936a09c9488b3a7300d63cdbeda1a3832c6ed8ace17d31b7d7a7333cdc5/slangpy-0.37.0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:8ed229ae0dcb9e517c31bbe5b0993ae6bbd8931357aa34ffcc2ac9b2b792a331", size = 74887953, upload-time = "2025-10-15T16:20:00.071Z" },
+    { url = "https://files.pythonhosted.org/packages/11/51/8aa4ab879092890c21d013c05ad3d00c2cb036f08d6aa5c7e67b7be0d68f/slangpy-0.37.0-cp312-cp312-win_amd64.whl", hash = "sha256:3373f2ebcac08a10e88ef34d365662bc4e822471659ed67d31480e4bb481bcf5", size = 63756392, upload-time = "2025-10-15T16:20:04.018Z" },
 ]
 
 [[package]]
