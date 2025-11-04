@@ -12,6 +12,7 @@ uv.lock
 .vscode/
 .idea/
 ./scripts/test/*
+data/
 **.nii.gz
 .DS_Store
 site/
