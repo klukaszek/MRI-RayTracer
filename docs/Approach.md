@@ -1,4 +1,4 @@
-The most effective approach, supported by the sources, is to implement a **Differentiable Hybrid Raycasting Pipeline** (similar to Neural Ray-Tracing (NRT) or FEGR) which disentangles geometric structure from appearance parameters, making the medical scans easier to interpret and potentially more accurate.
+The most effective approach, supported by our sources, is to implement a **Differentiable Hybrid Raycasting Pipeline** (similar to Neural Ray-Tracing (NRT) or FEGR) which disentangles geometric structure from appearance parameters, making the medical scans easier to interpret and potentially more accurate.
 
 Below is a structured guide detailing the necessary research and implementation steps, heavily leveraging the principles of automatic differentiation (autodiff) and neural rendering found in the sources.
 

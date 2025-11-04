@@ -30,7 +30,7 @@ This document details how we integrate neural rendering policies with neuroimagi
 - Create SlangPy textures for each 3D array (e.g., `r16float` for intensities; `r8unorm`/`r16float` for P/B/U).
 - Keep modalities separate or in a texture array; keep ROI maps as single‑channel textures.
 
-## Shader Design (Slang) — Kyle
+## Shader Design
 - Core ray marcher: emission–absorption integration with early termination and optional occupancy grid.
 - On‑the‑fly features per step:
   - Density and gradient magnitude (via finite differences or mip‑based gradients)
@@ -46,7 +46,7 @@ This document details how we integrate neural rendering policies with neuroimagi
   - If P(x) high or near boundary (|B(x)| small), clamp delta‑t to a minimum and disable skipping.
   - Else, apply policy outputs to increase step size or skip low‑value regions.
 
-## Training the Policy (Offline) — Kyle
+## Training the Policy
 - Data: a small set of volumes (medical + non‑medical) with rendered references (very small delta‑t, no skip).
 - Loss: `J = image_error + α · sample_cost`, with voxel/pixel weights higher inside/near ROI boundaries.
 - Optimizers: start with AdamW (1e‑4 to 3e‑4), cosine decay with warmup; gradient clip 1.0; EMA optional.
@@ -59,7 +59,7 @@ This document details how we integrate neural rendering policies with neuroimagi
 - ROI fidelity: ROI‑PSNR and Weighted‑PSNR `w(x)=1+β·P(x)+γ·boundary` with 95% CI across frames.
 - Generalization: held‑out views and unseen subjects; report ΔPSNR/ΔSSIM.
 
-## Neuro Track — Kasra (Owner)
+## Neuro Track
 - Segmentation outputs: curate and package expert masks; optional probability refinement via a pretrained BraTS U‑Net.
 - Biomarker baselines: radiomics (PyRadiomics + Logistic Regression/Random Forest) and, time permitting, a lightweight 3D CNN for IDH/MGMT with stratified 5‑fold CV.
 - Exports to renderer: per‑voxel P(x), boundary distance, optional U(x); per‑subject biomarker predictions and saliency overlays.

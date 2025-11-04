@@ -11,3 +11,7 @@ uv.lock
 # editor junk
 .vscode/
 .idea/
+./scripts/test/*
+**.nii.gz
+.DS_Store
+site/

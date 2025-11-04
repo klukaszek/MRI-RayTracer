@@ -131,6 +131,7 @@ class App:
         try:
             # Call without filters to avoid backend issues on macOS
             path = spy.platform.open_file_dialog()
+            print("No Error!")
         except Exception as e:
             self.mesh_info.text = f"Open dialog error: {e}"
             return
@@ -242,8 +243,8 @@ class App:
                 )
                 command_encoder.blit(surface_texture, self.output_texture)
 
-            self.ui.new_frame(surface_texture.width, surface_texture.height)
-            self.ui.render(surface_texture, command_encoder)
+            self.ui.begin_frame(surface_texture.width, surface_texture.height)
+            self.ui.end_frame(surface_texture, command_encoder)
 
             self.device.submit_command_buffer(command_encoder.finish())
             del surface_texture

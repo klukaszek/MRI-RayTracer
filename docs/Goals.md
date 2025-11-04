@@ -26,15 +26,13 @@ We compromise on our ideas by keeping the neural‑shader contribution at the co
 ### Datasets:
 - UCSF‑PDGM (DOI: 10.7937/tcia.bdgf-8v37). We’ll cite per policy, load co‑registered NIfTI volumes, normalize them, and pack them as 3D textures for the viewer.
 	- https://www.cancerimagingarchive.net/collection/ucsf-pdgm/
-- Free OpenVDB sample files from EmberGen. There are loads of static (and dynamic) volumetric clouds, dust storms, fluids, and other cool things. We can cite them per download via the URL and Corp name (JangaFX).
-	- https://jangafx.com/software/embergen/download/free-vdb-animations
-### Who does what
-- Kyle: Rendering & policy MLP
+- BraTS-2023 Brain Tumor glioma segmentation datasets
+	- https://www.synapse.org/brats2023/
+### What needs to be done
   - SlangPy viewer and shader integration
   - In‑shader MLP inference, PyTorch training/export, parity checks
   - Loading of volumetric data into the renderer using appropriate pipelines.
   - Performance/quality measurement and Pareto plots
-- Kasra: Neuro-imaging & ML data 
   - UCSF‑PDGM preprocessing: curate/export tumor probability and boundary/uncertainty maps
   - Biomarker baselines (IDH/MGMT) via pyradiomics and a small CNN. We use this information to generate overlays for renderer tumor identification.
   - Collaborate on ROI‑focused metrics and viewer toggles for our renderer. 
