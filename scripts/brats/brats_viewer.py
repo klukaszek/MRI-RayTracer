@@ -178,8 +178,9 @@ class BraTSViewer:
 
         # Segmentation group
         self.seg_group = spy.ui.Group(window, "Segmentation")
-        self.seg_check = spy.ui.CheckBox(self.seg_group, "Show Segmentation", value=self.show_seg)
-        self.seg_gray = spy.ui.CheckBox(self.seg_group, "Greyscale Seg", value=self.use_grayscale_seg)
+        # Ground truth segmentation overlay controls
+        self.seg_check = spy.ui.CheckBox(self.seg_group, "Show Ground Truth", value=self.show_seg)
+        self.seg_gray = spy.ui.CheckBox(self.seg_group, "Greyscale Ground Truth", value=self.use_grayscale_seg)
         spy.ui.Text(window, "Orbit: LMB | Pan: Shift+LMB | Zoom: Wheel")
 
     def _create_float_buffer(self, linear: np.ndarray):
@@ -261,6 +262,23 @@ class BraTSViewer:
             else:
                 self.seg_buffer = self._create_uint_buffer(slin)
                 self.seg_buffer.copy_from_numpy(slin)
+        # Enable/disable seg UI based on availability
+        try:
+            has_seg = self.seg_buffer is not None
+            # Toggle checkbox enabled state if supported
+            if hasattr(self.seg_check, 'enabled'):
+                self.seg_check.enabled = has_seg
+            if hasattr(self.seg_gray, 'enabled'):
+                self.seg_gray.enabled = has_seg
+            # If no seg, uncheck
+            if not has_seg:
+                if hasattr(self.seg_check, 'value'):
+                    self.seg_check.value = False
+                if hasattr(self.seg_gray, 'value'):
+                    self.seg_gray.value = False
+                self.show_seg = False
+        except Exception:
+            pass
 
         # Update UI text
         lines = [f"Dir: {case_dir.name}", f"Dims: {int(dims[0])} x {int(dims[1])} x {int(dims[2])}",
