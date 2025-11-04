@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import argparse
 from pathlib import Path
 import numpy as np
 import slangpy as spy
@@ -14,7 +15,7 @@ sys.path.append(str(HERE.parent / "raymarch"))
 from camera import OrbitalCamera
 
 class App:
-    def __init__(self):
+    def __init__(self, nifti_mask: str | None = None, mask_mode: str = "occupancy"):
         self.window = spy.Window(title="Volume Rendering (SlangPy)", resizable=True)
         self.device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [HERE]})
         self.surface = self.device.create_surface(self.window)
@@ -64,8 +65,17 @@ class App:
             # Compressed ASTC/BC4 files are copied but not loaded here (SlangPy upload expects unpacked data).
         }
         self.selected_format_key = "r8unorm"
-        # Load default r8 volume before UI setup
-        self._load_volume_r8(self.format_options[self.selected_format_key])
+        # Load requested NIfTI ground-truth mask if provided, otherwise default demo volume
+        if nifti_mask is not None:
+            try:
+                self._load_nifti_mask(Path(nifti_mask), mode=mask_mode)
+            except Exception as e:
+                self.status_text = f"NIfTI load failed: {e}"
+                # Fallback to demo volume
+                self._load_volume_r8(self.format_options[self.selected_format_key])
+        else:
+            # Default demo volume
+            self._load_volume_r8(self.format_options[self.selected_format_key])
 
         # UI elements
         self._setup_ui()
@@ -153,6 +163,39 @@ class App:
         arr = np.frombuffer(raw, dtype=np.uint8)
         self._upload_u8_volume_from_array(arr)
         self.status_text = f"Loaded: {path.name} (r8unorm)"
+
+    def _load_nifti_mask(self, path: Path, mode: str = "occupancy"):
+        try:
+            import nibabel as nib
+        except Exception as e:
+            raise RuntimeError(
+                "nibabel not installed. Please `uv pip install nibabel` or add it to pyproject.") from e
+
+        if not path.exists():
+            raise FileNotFoundError(f"NIfTI file not found: {path}")
+
+        img = nib.load(str(path))
+        data = img.get_fdata(dtype=np.float32)
+        # Expect shape (X, Y, Z). Convert to labels uint8.
+        if mode == "occupancy":
+            vol_u8 = (data > 0.5).astype(np.uint8) * 255
+        elif mode == "labels":
+            # Map BraTS labels: 0->0, 1->85, 2->170, 4->255
+            vol_u8 = np.zeros_like(data, dtype=np.uint8)
+            vol_u8[np.isclose(data, 1.0)] = 85
+            vol_u8[np.isclose(data, 2.0)] = 170
+            vol_u8[np.isclose(data, 4.0)] = 255
+        else:
+            raise ValueError(f"Unknown mask_mode '{mode}'. Use 'occupancy' or 'labels'.")
+
+        # Slang shader expects flattened (D,H,W) with x fastest. Convert (X,Y,Z) -> (Z,Y,X)
+        x, y, z = vol_u8.shape[0], vol_u8.shape[1], vol_u8.shape[2]
+        self.volume_width = int(x)
+        self.volume_height = int(y)
+        self.volume_depth = int(z)
+        vol_dhw = np.transpose(vol_u8, (2, 1, 0)).copy(order='C')
+        self._upload_u8_volume_from_array(vol_dhw.reshape(-1))
+        self.status_text = f"Loaded NIfTI: {path.name} [{mode}] {x}x{y}x{z}"
 
     def _load_volume_bc4(self, path: Path):
         # Decompress gzip to BC4 block stream, decode all tiles with NumPy
@@ -342,4 +385,9 @@ class App:
 
 
 if __name__ == "__main__":
-    App().run()
+    parser = argparse.ArgumentParser(description="SlangPy Volume Renderer with NIfTI GT support")
+    parser.add_argument("--nii", type=str, default=None, help="Path to NIfTI mask (.nii or .nii.gz) to render")
+    parser.add_argument("--mode", type=str, default="occupancy", choices=["occupancy", "labels"], help="Render mask as binary occupancy or label intensities")
+    args = parser.parse_args()
+
+    App(nifti_mask=args.nii, mask_mode=args.mode).run()
