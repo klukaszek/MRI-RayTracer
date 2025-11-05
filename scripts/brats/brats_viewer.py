@@ -122,7 +122,8 @@ class BraTSViewer:
 
         # Raymarching
         self.step_size = 0.05
-        self.bg_color = np.array([0.05, 0.06, 0.08], dtype=np.float32)
+        self.bg_color = np.array([0.0, 0.0, 0.0])
+        # self.bg_color = np.array([0.05, 0.06, 0.08], dtype=np.float32)
         self.pan_speed = 0.2
         self.drag_deadzone_px = 6.0
         self._lmb = False
@@ -214,16 +215,24 @@ class BraTSViewer:
         files = list(Path(case_dir).glob("*.nii.gz"))
         mod_files: Dict[str, Path] = {}
         seg_file: Optional[Path] = None
+        # Accept both BraTS-style ("-t1c") and MU-Glioma-style ("_t1c", "_brain_t1c") suffixes.
+        # Also accept segmentation names like "-seg", "_seg", "_tumorMask".
         for f in files:
             name = f.name.lower()
-            if name.endswith("-seg.nii.gz"):
+            # Known segmentation filename endings
+            if name.endswith(("-seg.nii.gz", "_seg.nii.gz", "-tumormask.nii.gz", "_tumormask.nii.gz")):
                 seg_file = f
                 continue
+            # Known modality suffixes with either '-' or '_' separator
             for suf, key in MOD_SUFFIXES.items():
-                if name.endswith(f"-{suf}.nii.gz"):
+                if name.endswith(f"-{suf}.nii.gz") or name.endswith(f"_{suf}.nii.gz"):
                     mod_files[key] = f
         if not mod_files:
-            raise RuntimeError(f"No modality volumes found in {case_dir}")
+            raise RuntimeError(
+                "No modality volumes found in "
+                f"{case_dir}. Expected files ending with one of: "
+                "-t1n/_t1n, -t1c/_t1c, -t2w/_t2w, -t2f/_t2f"
+            )
 
         # Load first modality to get dims/voxels
         first_key = next(iter(mod_files))
