@@ -103,6 +103,10 @@ class BraTSViewer:
         self.ww = 1.0
         self.wl = 0.5
         self.intensity_alpha = 0.4
+        # Tone/edge shaping
+        self.gamma = 1.0
+        self.grad_boost = 1.5
+        self.grad_scale = 1.0
 
         # Ray near/far clipping along ray parameter t (world units)
         # far_t = 0 disables far clipping
@@ -170,6 +174,9 @@ class BraTSViewer:
         self.alpha_slider = spy.ui.SliderFloat(self.int_group, "Intensity Alpha", value=self.intensity_alpha, min=0.0, max=1.0)
         self.ww_slider = spy.ui.SliderFloat(self.int_group, "Window Width", value=self.ww, min=0.01, max=2.0)
         self.wl_slider = spy.ui.SliderFloat(self.int_group, "Window Level", value=self.wl, min=0.0, max=1.0)
+        self.gamma_slider = spy.ui.SliderFloat(self.int_group, "Gamma", value=self.gamma, min=0.2, max=3.0)
+        self.grad_boost_slider = spy.ui.SliderFloat(self.int_group, "Edge Boost", value=self.grad_boost, min=0.0, max=4.0)
+        self.grad_scale_slider = spy.ui.SliderFloat(self.int_group, "Edge Scale", value=self.grad_scale, min=0.1, max=4.0)
         # Modality toggles and weights
         self.mod_check: Dict[str, spy.ui.CheckBox] = {}
         self.mod_weight: Dict[str, spy.ui.SliderFloat] = {}
@@ -302,6 +309,12 @@ class BraTSViewer:
         # Set step and near/far ranges based on voxel size and volume extent
         vmin = float(np.min(self.voxel_size))
         self.step_size = 0.75 * vmin
+        # Default gradient scale ~ inverse voxel to keep [0,1]
+        try:
+            self.grad_scale = float(1.0)
+            self.grad_scale_slider.value = self.grad_scale
+        except Exception:
+            pass
         try:
             # Update step slider bounds
             self.step_slider.min = max(1e-6, 0.05 * vmin)
@@ -482,6 +495,9 @@ class BraTSViewer:
             self.intensity_alpha = float(self.alpha_slider.value)
             self.ww = float(self.ww_slider.value)
             self.wl = float(self.wl_slider.value)
+            self.gamma = float(self.gamma_slider.value)
+            self.grad_boost = float(self.grad_boost_slider.value)
+            self.grad_scale = float(self.grad_scale_slider.value)
             # Near/Far and pan speed from UI
             try:
                 self.near_t = max(0.0, float(self.near_slider.value))
@@ -536,6 +552,9 @@ class BraTSViewer:
                 "ww": np.float32(self.ww),
                 "wl": np.float32(self.wl),
                 "intensityAlpha": np.float32(self.intensity_alpha),
+                "gamma": np.float32(self.gamma),
+                "gradBoost": np.float32(self.grad_boost),
+                "gradScale": np.float32(self.grad_scale),
                 "showSeg": np.uint32(1 if (self.show_seg and self.seg_buffer is not None) else 0),
                 "lutColorAlpha": [tuple(map(float, row)) for row in lut_use.tolist()],
             }
