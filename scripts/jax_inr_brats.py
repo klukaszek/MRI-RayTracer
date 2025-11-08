@@ -27,6 +27,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Sequence, Optional
+from collections import OrderedDict
 
 import numpy as np
 import nibabel as nib
@@ -73,13 +74,22 @@ def _load_case(case_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     return mods_arr, seg
 
 
-def load_case_list(case_paths: Sequence[str]):
-    """Load cases into a lightweight Python list to avoid a single giant device array."""
-    cache: List[Dict[str, np.ndarray]] = []
-    for cp in case_paths:
-        mods, seg = _load_case(cp)
-        cache.append({"mods": mods, "seg": seg})
-    return cache
+class CaseLRU:
+    """Small LRU cache to avoid holding all cases in memory at once."""
+    def __init__(self, paths: Sequence[str], capacity: int = 4):
+        self.paths = list(paths)
+        self.capacity = capacity
+        self._cache: OrderedDict[int, Dict[str, np.ndarray]] = OrderedDict()
+
+    def get(self, idx: int) -> Dict[str, np.ndarray]:
+        if idx in self._cache:
+            self._cache.move_to_end(idx)
+            return self._cache[idx]
+        mods, seg = _load_case(self.paths[idx])
+        if len(self._cache) >= self.capacity:
+            self._cache.popitem(last=False)
+        self._cache[idx] = {"mods": mods, "seg": seg}
+        return self._cache[idx]
 
 
 def fourier_features(coords: jnp.ndarray, k: int, rff_B: Optional[jnp.ndarray] = None) -> jnp.ndarray:
@@ -248,6 +258,8 @@ def main():
     ap.add_argument("--tumor-ratio", type=float, default=0.4, help="Fraction of tumour voxels in each micro-batch [0,1]")
     ap.add_argument("--rff-dim", type=int, default=0, help="Random Fourier feature dim (0 to disable)")
     ap.add_argument("--rff-sigma", type=float, default=0.0, help="Stddev for RFF Gaussian B; >0 enables RFF")
+    ap.add_argument("--pool-size", type=int, default=4, help="Number of cases to keep on-device for JIT sampling (0 disables)")
+    ap.add_argument("--pool-refresh", type=int, default=200, help="Steps between case pool refreshes")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -259,14 +271,14 @@ def main():
     train_cases = all_cases[: args.case_limit]
     print(f"Using {len(train_cases)} training cases")
 
-    train_cache = load_case_list(train_cases)
-    # Use first case to infer dims
-    M, H, W, D = train_cache[0]["mods"].shape
+    case_cache = CaseLRU(train_cases, capacity=max(4, args.pool_size))
+    # Use first case to infer dims (lazy load)
+    M, H, W, D = case_cache.get(0)["mods"].shape
     print("Data dims (M,H,W,D)=", (M, H, W, D))
 
     # Dummy input to determine input dimension
     key = jax.random.PRNGKey(args.seed)
-    coords, feats, _ = sample_from_single_case_np(key, train_cache[0], 2)
+    coords, feats, _ = sample_from_single_case_np(key, case_cache.get(0), 2)
     # Random Fourier feature matrix (if enabled)
     rff_B = None
     if args.rff_sigma > 0.0 and args.rff_dim > 0:
@@ -350,12 +362,12 @@ def main():
         for i in range(accum_steps):
             key, sub_case, sub = jax.random.split(key, 3)
             # pick one random case for this micro-step
-            case_idx = int(jax.random.randint(sub_case, (), 0, len(train_cache)))
+            case_idx = int(jax.random.randint(sub_case, (), 0, len(train_cases)))
             # Enforce tumour/background mix per micro-batch via rejection sampling
             tumour_ratio = float(np.clip(args.tumor_ratio, 0.0, 1.0))
             tb = int(micro_bs * tumour_ratio)
             rb = micro_bs - tb
-            case = train_cache[case_idx]
+            case = case_cache.get(case_idx)
             M, H, W, D = case["mods"].shape
             # Background/uniform samples
             cx = np.array(jax.random.randint(sub, (rb,), 0, H));
@@ -399,16 +411,82 @@ def main():
         params2 = optax.apply_updates(params, updates)
         return params2, opt_state2, loss_acc / accum_steps, key
 
+    # Pool-based JIT train step to increase CPU utilization
+    def build_pool_jax(pool_indices):
+        mods = []
+        segs = []
+        for idx in pool_indices:
+            c = case_cache.get(int(idx))
+            mods.append(c["mods"])  # np arrays
+            segs.append(c["seg"])
+        mods_np = np.stack(mods, axis=0)
+        segs_np = np.stack(segs, axis=0)
+        return jnp.array(mods_np), jnp.array(segs_np)
+
+    @jax.jit
+    def train_step_pool(params, opt_state, rng_key, mods_pool, segs_pool):
+        P, M, H, W, D = mods_pool.shape
+        grads_init = jax.tree_util.tree_map(jnp.zeros_like, params)
+        loss_init = jnp.array(0.0, dtype=jnp.float32)
+
+        def body(i, carry):
+            params_c, opt_state_c, grads_acc, loss_acc, key_c = carry
+            key_c, kcase, kx, ky, kz = jax.random.split(key_c, 5)
+            ci = jax.random.randint(kcase, (micro_bs,), 0, P)
+            xs = jax.random.randint(kx, (micro_bs,), 0, H)
+            ys = jax.random.randint(ky, (micro_bs,), 0, W)
+            zs = jax.random.randint(kz, (micro_bs,), 0, D)
+
+            def gather(ci_i, x, y, z):
+                intens = mods_pool[ci_i, :, x, y, z]
+                lab = segs_pool[ci_i, x, y, z]
+                return intens, lab
+            intens, labels = jax.vmap(gather)(ci, xs, ys, zs)
+            coords = jnp.stack([xs, ys, zs], axis=-1)
+            norm = (coords / (jnp.array([H-1, W-1, D-1]))) * 2.0 - 1.0
+
+            def _loss(p):
+                return loss_fn(p, norm, intens, labels, args.fourier_freqs, rff_B, class_weights, args.dice_weight)
+            l, g = jax.value_and_grad(_loss)(params_c)
+            grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, g)
+            loss_acc = loss_acc + l
+            return (params_c, opt_state_c, grads_acc, loss_acc, key_c)
+
+        params2, opt_state2, grads_sum, loss_sum, key_out = jax.lax.fori_loop(
+            0, accum_steps, body, (params, opt_state, grads_init, loss_init, rng_key)
+        )
+        grads_mean = jax.tree_util.tree_map(lambda x: x / accum_steps, grads_sum)
+        updates, opt_state3 = optimizer.update(grads_mean, opt_state2, params2)
+        params3 = optax.apply_updates(params2, updates)
+        return params3, opt_state3, loss_sum / accum_steps, key_out
+
+    # Build initial pool for higher CPU utilization
+    pool_size = max(0, int(args.pool_size))
+    pool_indices = np.random.choice(len(train_cases), size=min(pool_size, len(train_cases)), replace=False) if pool_size>0 else []
+    if pool_size>0:
+        mods_pool, segs_pool = build_pool_jax(pool_indices)
+        print(f"Initialized case pool of size {mods_pool.shape[0]}")
+
     # Warm-up
     key, step_key = jax.random.split(key)
-    params, opt_state, warm_loss, key = train_step_host(params, opt_state, step_key)
+    if pool_size>0:
+        params, opt_state, warm_loss, key = train_step_pool(params, opt_state, step_key, mods_pool, segs_pool)
+    else:
+        params, opt_state, warm_loss, key = train_step_host(params, opt_state, step_key)
     print(f"Warm-up loss: {float(warm_loss):.4f}")
 
     # Train
     start = time.time()
     for step in range(1, args.steps + 1):
         key, step_key = jax.random.split(key)
-        params, opt_state, loss_val, key = train_step_host(params, opt_state, step_key)
+        if pool_size>0:
+            # periodic refresh to vary cases in device pool
+            if step % max(1, int(args.pool_refresh)) == 0:
+                pool_indices = np.random.choice(len(train_cases), size=min(pool_size, len(train_cases)), replace=False)
+                mods_pool, segs_pool = build_pool_jax(pool_indices)
+            params, opt_state, loss_val, key = train_step_pool(params, opt_state, step_key, mods_pool, segs_pool)
+        else:
+            params, opt_state, loss_val, key = train_step_host(params, opt_state, step_key)
         if step % 20 == 0 or step == 1:
             print(f"Step {step}/{args.steps} | loss={float(loss_val):.4f}")
     print("Training time: {:.2f}s".format(time.time() - start))
