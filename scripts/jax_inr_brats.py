@@ -17,6 +17,14 @@ Example:
     --val-index 0 \
     --chunk 120000 \
     --out artifacts/inr_brats23.npz
+
+New training controls (for minority class enhancement & noise suppression):
+  --per-class-dice           Use per-class soft Dice instead of prevalence-weighted
+  --focal-gamma <g>          Enable focal loss with gamma=g (e.g., 2.0)
+  --focal-alpha a,b,c,d      Per-class alpha weights for focal scaling
+  --label-smoothing <eps>    Apply label smoothing (e.g., 0.02)
+  --min-subclass-samples i,j,k  Ensure at least i (NCR/NET), j (Edema), k (Enhancing) samples per micro-batch
+These mitigate over-predicted edema (green) and underrepresented enhancing (red) & NCR/NET (blue).
 """
 
 from __future__ import annotations
@@ -70,6 +78,8 @@ def _load_case(case_dir: str) -> Tuple[np.ndarray, np.ndarray]:
         mods.append(arr)
     seg_fp = os.path.join(case_dir, f"{base}-{SEG_SUFFIX}.nii.gz")
     seg = nib.load(seg_fp).get_fdata().astype(np.int16)
+    # Remap BraTS labels 4->3 for training with NUM_CLASSES=4 (0..3)
+    seg[seg == 4] = 3
     mods_arr = np.stack(mods, axis=0)  # (M,H,W,D)
     return mods_arr, seg
 
@@ -166,33 +176,92 @@ def sample_from_single_case_np(rng_key, case: Dict[str, np.ndarray], batch_size:
     return jnp.array(norm_coords), jnp.array(intens), jnp.array(labels)
 
 
-def soft_dice_loss(probs: jnp.ndarray, onehot: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+def soft_dice_loss(probs: jnp.ndarray, onehot: jnp.ndarray, eps: float = 1e-6, per_class: bool = False) -> jnp.ndarray:
     # probs/onehot: (B,C)
     inter = jnp.sum(probs * onehot, axis=0)
     sums = jnp.sum(probs, axis=0) + jnp.sum(onehot, axis=0)
     dice = (2 * inter + eps) / (sums + eps)
-    return 1.0 - jnp.mean(dice)
+    if per_class:
+        return 1.0 - jnp.mean(dice)
+    else:
+        # Reduce over classes by weighting with class prevalence in batch
+        weights = jnp.sum(onehot, axis=0)
+        weights = weights / (jnp.sum(weights) + eps)
+        return 1.0 - jnp.sum(dice * weights)
+
+def focal_ce_loss(logits: jnp.ndarray, onehot: jnp.ndarray, gamma: float, alpha: Optional[jnp.ndarray]) -> jnp.ndarray:
+    # Numerically stable focal CE
+    logp = jax.nn.log_softmax(logits, axis=-1)
+    p = jnp.exp(logp)
+    ce = -jnp.sum(onehot * logp, axis=-1)
+    pt = jnp.sum(onehot * p, axis=-1)
+    mod = jnp.power(1.0 - pt, gamma)
+    if alpha is not None:
+        a = jnp.sum(onehot * alpha[None, :], axis=-1)
+        mod = mod * a
+    return jnp.mean(mod * ce)
 
 
-def loss_fn(params, coords, intensities, labels, k, rff_B, class_weights=None, dice_weight: float = 0.0):
+def loss_fn(params, coords, intensities, labels, k, rff_B, rng_key,
+            class_weights=None, dice_weight: float = 0.0,
+            per_class_dice: bool = False, focal_gamma: float = 0.0, focal_alpha: Optional[jnp.ndarray] = None,
+            label_smoothing: float = 0.0, freq_dropout: float = 0.0, edema_fp_weight: float = 0.0,
+            tversky_alpha: float = 0.8, tversky_beta: float = 0.2, tversky_weight: float = 0.0,
+            edema_logit_reg: float = 0.0):
     x = build_input(coords, intensities, k, rff_B)
+    if freq_dropout > 0.0:
+        coord_dim = coords.shape[-1]
+        modal_dim = intensities.shape[-1]
+        ff_dim = (2 * rff_B.shape[-1]) if (rff_B is not None) else (coord_dim * 2 * k)
+        if ff_dim > 0:
+            key_mask = jax.random.fold_in(rng_key, ff_dim)
+            mask = (jax.random.uniform(key_mask, (ff_dim,), dtype=x.dtype) > freq_dropout).astype(x.dtype)
+            start = coord_dim
+            end = coord_dim + ff_dim
+            x = x.at[:, start:end].multiply(mask[None, :])
     logits = apply_mlp(params, x)
     y = one_hot(labels, NUM_CLASSES)
-    ce = optax.softmax_cross_entropy(logits, y)
+    if label_smoothing > 0.0:
+        y = y * (1.0 - label_smoothing) + label_smoothing / NUM_CLASSES
+    if focal_gamma > 0.0:
+        ce = focal_ce_loss(logits, y, focal_gamma, focal_alpha)
+    else:
+        ce = optax.softmax_cross_entropy(logits, y)
     if class_weights is not None:
         w = jnp.take(class_weights, labels)
         ce = ce * w
     ce = jnp.mean(ce)
+    probs = jax.nn.softmax(logits, axis=-1)
+    total = ce
     if dice_weight > 0.0:
-        probs = jax.nn.softmax(logits, axis=-1)
-        dl = soft_dice_loss(probs, y)
-        return (1.0 - dice_weight) * ce + dice_weight * dl
-    return ce
+        dl = soft_dice_loss(probs, y, per_class=per_class_dice)
+        total = (1.0 - dice_weight) * ce + dice_weight * dl
+    if edema_fp_weight > 0.0:
+        edema_gt = (labels == 2).astype(probs.dtype)
+        edema_fp = jnp.mean(probs[:, 2] * (1.0 - edema_gt))
+        total = total + edema_fp_weight * edema_fp
+    if tversky_weight > 0.0:
+        edema_gt = (labels == 2).astype(probs.dtype)
+        p_e = probs[:, 2]
+        tp = jnp.sum(p_e * edema_gt)
+        fp = jnp.sum(p_e * (1.0 - edema_gt))
+        fn = jnp.sum((1.0 - p_e) * edema_gt)
+        denom = tp + tversky_alpha * fp + tversky_beta * fn + 1e-6
+        tv = tp / denom
+        total = total + tversky_weight * (1.0 - tv)
+    if edema_logit_reg > 0.0:
+        edema_gt = (labels == 2).astype(probs.dtype)
+        logit_e = logits[:, 2]
+        reg = jnp.mean(jax.nn.softplus(logit_e) * (1.0 - edema_gt))
+        total = total + edema_logit_reg * reg
+    return total
 
 
 def predict_volume(params, case_data: Dict[str, np.ndarray], k: int, chunk: int = 200_000, rff_B: Optional[jnp.ndarray] = None):
     mods = case_data["mods"]  # (M,H,W,D)
-    seg_true = case_data["seg"]
+    seg_true = case_data["seg"].copy()
+    # Ensure consistent label space 0..3
+    seg_true[seg_true == 4] = 3
     M, H, W, D = mods.shape
     # Optional light denoising to improve stability (signal processing)
     mods_proc = np.empty_like(mods)
@@ -254,6 +323,17 @@ def main():
     ap.add_argument("--resume", default=None, help="Path to .npz weights to resume training from")
     ap.add_argument("--clip-norm", type=float, default=1.0)
     ap.add_argument("--dice-weight", type=float, default=0.3, help="Weight for soft-Dice in loss (0 means pure CE)")
+    ap.add_argument("--per-class-dice", action="store_true", help="Use per-class soft Dice averaged over classes")
+    ap.add_argument("--focal-gamma", type=float, default=0.0, help="Focal loss gamma (0 disables)")
+    ap.add_argument("--focal-alpha", type=str, default=None, help="Comma weights for classes for focal alpha balancing")
+    ap.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon [0,0.1]")
+    ap.add_argument("--min-subclass-samples", type=str, default=None, help="Comma list for min samples per (1:NCR,2:Edema,3:Enh) per micro-batch, e.g., 4,8,6")
+    ap.add_argument("--freq-dropout", type=float, default=0.0, help="Probability to drop Fourier features (regularize high frequencies)")
+    ap.add_argument("--edema-fp-weight", type=float, default=0.0, help="Penalty weight for edema false positives")
+    ap.add_argument("--tversky-edema-alpha", type=float, default=0.8, help="Alpha for edema Tversky (FP weight)")
+    ap.add_argument("--tversky-edema-beta", type=float, default=0.2, help="Beta for edema Tversky (FN weight)")
+    ap.add_argument("--tversky-edema-weight", type=float, default=0.0, help="Weight for (1 - Tversky) edema term")
+    ap.add_argument("--edema-logit-reg", type=float, default=0.0, help="Regularization weight on edema logits outside GT (softplus)")
     ap.add_argument("--class-weights", type=str, default=None, help="Comma-separated weights for classes 0..3, e.g., 0.2,1,1,1")
     ap.add_argument("--tumor-ratio", type=float, default=0.4, help="Fraction of tumour voxels in each micro-batch [0,1]")
     ap.add_argument("--rff-dim", type=int, default=0, help="Random Fourier feature dim (0 to disable)")
@@ -351,9 +431,29 @@ def main():
             raise ValueError(f"--class-weights must have {NUM_CLASSES} values")
         class_weights = jnp.array(cw)
 
-    def _loss_batch(p, c, f, y):
-        return loss_fn(p, c, f, y, args.fourier_freqs, rff_B, class_weights, args.dice_weight)
+    focal_alpha = None
+    if args.focal_alpha is not None:
+        fa = np.array([float(x) for x in args.focal_alpha.split(',')], dtype=np.float32)
+        if fa.size != NUM_CLASSES:
+            raise ValueError(f"--focal-alpha must have {NUM_CLASSES} values")
+        focal_alpha = jnp.array(fa)
+
+    def _loss_batch(p, c, f, y, rng):
+        return loss_fn(p, c, f, y, args.fourier_freqs, rff_B, rng,
+                       class_weights, args.dice_weight,
+                       args.per_class_dice, args.focal_gamma, focal_alpha,
+                       args.label_smoothing, args.freq_dropout, args.edema_fp_weight,
+                       args.tversky_edema_alpha, args.tversky_edema_beta, args.tversky_edema_weight,
+                       args.edema_logit_reg)
     loss_and_grad = jax.jit(jax.value_and_grad(_loss_batch))
+
+    # Parse subclass min samples if provided
+    min_subclass = None
+    if args.min_subclass_samples is not None:
+        ms = np.array([int(x) for x in args.min_subclass_samples.split(',')], dtype=np.int32)
+        if ms.size != 3:
+            raise ValueError("--min-subclass-samples must have 3 integers: NCR/NET, Edema, Enhancing")
+        min_subclass = ms
 
     def train_step_host(params, opt_state, rng_key):
         grads_acc = jax.tree_util.tree_map(jnp.zeros_like, params)
@@ -374,25 +474,55 @@ def main():
             key, sy, sz = jax.random.split(key, 3)
             cy = np.array(jax.random.randint(sy, (rb,), 0, W));
             cz = np.array(jax.random.randint(sz, (rb,), 0, D));
-            # Tumour-biased samples (rejection)
+            # Tumor-biased / subclass-balanced sampling
+            seg_case = case["seg"]
             txs, tys, tzs = [], [], []
-            tries = 0
-            while len(txs) < tb and tries < 20:
-                tries += 1
-                key, kx, ky, kz = jax.random.split(key, 4)
-                xs = np.array(jax.random.randint(kx, (tb,), 0, H))
-                ys = np.array(jax.random.randint(ky, (tb,), 0, W))
-                zs = np.array(jax.random.randint(kz, (tb,), 0, D))
-                mask = case["seg"][xs, ys, zs] > 0
-                if mask.any():
-                    txs.extend(xs[mask].tolist()); tys.extend(ys[mask].tolist()); tzs.extend(zs[mask].tolist())
-            if len(txs) < tb:
-                # fallback to fill remainder uniformly
-                need = tb - len(txs)
-                key, kx, ky, kz = jax.random.split(key, 4)
-                txs += np.array(jax.random.randint(kx, (need,), 0, H)).tolist()
-                tys += np.array(jax.random.randint(ky, (need,), 0, W)).tolist()
-                tzs += np.array(jax.random.randint(kz, (need,), 0, D)).tolist()
+            if tb > 0:
+                if min_subclass is None:
+                    # Original rejection sampling
+                    tries = 0
+                    while len(txs) < tb and tries < 20:
+                        tries += 1
+                        key, kx, ky, kz = jax.random.split(key, 4)
+                        xs_try = np.array(jax.random.randint(kx, (tb,), 0, H))
+                        ys_try = np.array(jax.random.randint(ky, (tb,), 0, W))
+                        zs_try = np.array(jax.random.randint(kz, (tb,), 0, D))
+                        mask = seg_case[xs_try, ys_try, zs_try] > 0
+                        if mask.any():
+                            txs.extend(xs_try[mask].tolist()); tys.extend(ys_try[mask].tolist()); tzs.extend(zs_try[mask].tolist())
+                else:
+                    # Subclass-balanced: sample each class independently
+                    # Classes: 1=NCR/NET, 2=Edema, 3=Enhancing (BraTS numbering subset)
+                    needed = {1: int(min_subclass[0]), 2: int(min_subclass[1]), 3: int(min_subclass[2])}
+                    for cls, need in needed.items():
+                        if need <= 0:
+                            continue
+                        # Gather coordinates of this class (downsample if huge)
+                            # Random index picking
+                        coords_cls = np.argwhere(seg_case == cls)
+                        if coords_cls.size == 0:
+                            continue
+                        if coords_cls.shape[0] > need:
+                            sel = coords_cls[np.random.choice(coords_cls.shape[0], size=need, replace=False)]
+                        else:
+                            sel = coords_cls
+                        txs.extend(sel[:,0].tolist()); tys.extend(sel[:,1].tolist()); tzs.extend(sel[:,2].tolist())
+                    # Fill remaining tumor slots uniformly from any tumor voxel
+                    if len(txs) < tb:
+                        remaining = tb - len(txs)
+                        tumor_coords = np.argwhere(seg_case > 0)
+                        if tumor_coords.shape[0] > remaining:
+                            sel = tumor_coords[np.random.choice(tumor_coords.shape[0], size=remaining, replace=False)]
+                        else:
+                            sel = tumor_coords
+                        txs.extend(sel[:,0].tolist()); tys.extend(sel[:,1].tolist()); tzs.extend(sel[:,2].tolist())
+                if len(txs) < tb:
+                    # fallback fill
+                    need = tb - len(txs)
+                    key, kx, ky, kz = jax.random.split(key, 4)
+                    txs += np.array(jax.random.randint(kx, (need,), 0, H)).tolist()
+                    tys += np.array(jax.random.randint(ky, (need,), 0, W)).tolist()
+                    tzs += np.array(jax.random.randint(kz, (need,), 0, D)).tolist()
             xs = np.concatenate([np.array(txs[:tb]), cx])
             ys = np.concatenate([np.array(tys[:tb]), cy])
             zs = np.concatenate([np.array(tzs[:tb]), cz])
@@ -403,7 +533,8 @@ def main():
             intens = case["mods"][:, xs, ys, zs].transpose(1, 0)
             labels = case["seg"][xs, ys, zs].astype(np.int32)
             c = jnp.array(norm_coords); f = jnp.array(intens); y = jnp.array(labels)
-            loss_val, grads = loss_and_grad(params, c, f, y)
+            key, kdrop = jax.random.split(key)
+            loss_val, grads = loss_and_grad(params, c, f, y, kdrop)
             grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
             loss_acc += float(loss_val)
         grads_mean = jax.tree_util.tree_map(lambda x: x / accum_steps, grads_acc)
@@ -436,6 +567,65 @@ def main():
             xs = jax.random.randint(kx, (micro_bs,), 0, H)
             ys = jax.random.randint(ky, (micro_bs,), 0, W)
             zs = jax.random.randint(kz, (micro_bs,), 0, D)
+            if min_subclass is not None:
+                # Replace portion with subclass-balanced indices using rejection on fixed candidates.
+                seg_case = segs_pool[ci[0]]
+                needed = (int(min_subclass[0]), int(min_subclass[1]), int(min_subclass[2]))
+                max_cand = micro_bs  # candidate count per class
+
+                def sample_class(cls, need, key_s):
+                    if need <= 0:
+                        return (jnp.full((0,), -1, dtype=jnp.int32),
+                                jnp.full((0,), -1, dtype=jnp.int32),
+                                jnp.full((0,), -1, dtype=jnp.int32))
+                    kx, ky, kz = jax.random.split(key_s, 3)
+                    cx = jax.random.randint(kx, (max_cand,), 0, H)
+                    cy = jax.random.randint(ky, (max_cand,), 0, W)
+                    cz = jax.random.randint(kz, (max_cand,), 0, D)
+                    labs = seg_case[cx, cy, cz]
+                    mask = (labs == cls)
+                    ranks = jnp.cumsum(mask.astype(jnp.int32))
+                    idxs = jnp.arange(max_cand, dtype=jnp.int32)
+                    big = max_cand + 1
+
+                    def pick_one(k, _):
+                        # index of the k-th True in mask (or big if not present)
+                        pos = jnp.argmin(jnp.where(ranks == k, idxs, big))
+                        return None, pos
+                    _, positions = jax.lax.scan(pick_one, None, jnp.arange(1, need + 1, dtype=jnp.int32))
+                    # Gather coords; invalid positions (==big) replaced later by -1
+                    sel_x = jnp.where(positions < max_cand, cx[positions], -1)
+                    sel_y = jnp.where(positions < max_cand, cy[positions], -1)
+                    sel_z = jnp.where(positions < max_cand, cz[positions], -1)
+                    return sel_x, sel_y, sel_z
+
+                key_c1, key_c2, key_c3 = jax.random.split(kcase, 3)
+                sx1, sy1, sz1 = sample_class(1, needed[0], key_c1)
+                sx2, sy2, sz2 = sample_class(2, needed[1], key_c2)
+                sx3, sy3, sz3 = sample_class(3, needed[2], key_c3)
+                all_x = jnp.concatenate([sx1, sx2, sx3])
+                all_y = jnp.concatenate([sy1, sy2, sy3])
+                all_z = jnp.concatenate([sz1, sz2, sz3])
+                valid = (all_x >= 0)
+                # Compute indices of up to K valid entries using static K = micro_bs//2
+                K = micro_bs // 2
+                # Build scan to collect indices without dynamic slicing
+                def collect(carry, i):
+                    count, out = carry
+                    take = (valid[i] & (count < K))
+                    out = out.at[count].set(i)
+                    count = count + jnp.where(take, 1, 0)
+                    return (count, out), None
+                init_idx = jnp.full((K,), 0, dtype=jnp.int32)
+                (count_final, idx_buf), _ = jax.lax.scan(collect, (0, init_idx), jnp.arange(all_x.shape[0]))
+                k_eff = jnp.minimum(count_final, K)
+                # Gather selected entries via dynamic_update_slice
+                rep_x = all_x[idx_buf]
+                rep_y = all_y[idx_buf]
+                rep_z = all_z[idx_buf]
+                xs = jax.lax.dynamic_update_slice(xs, rep_x, (0,))
+                ys = jax.lax.dynamic_update_slice(ys, rep_y, (0,))
+                zs = jax.lax.dynamic_update_slice(zs, rep_z, (0,))
 
             def gather(ci_i, x, y, z):
                 intens = mods_pool[ci_i, :, x, y, z]
@@ -445,8 +635,14 @@ def main():
             coords = jnp.stack([xs, ys, zs], axis=-1)
             norm = (coords / (jnp.array([H-1, W-1, D-1]))) * 2.0 - 1.0
 
+            key_c, kdrop = jax.random.split(key_c)
             def _loss(p):
-                return loss_fn(p, norm, intens, labels, args.fourier_freqs, rff_B, class_weights, args.dice_weight)
+                return loss_fn(p, norm, intens, labels, args.fourier_freqs, rff_B, kdrop,
+                               class_weights, args.dice_weight,
+                               args.per_class_dice, args.focal_gamma, focal_alpha,
+                               args.label_smoothing, args.freq_dropout, args.edema_fp_weight,
+                               args.tversky_edema_alpha, args.tversky_edema_beta, args.tversky_edema_weight,
+                               args.edema_logit_reg)
             l, g = jax.value_and_grad(_loss)(params_c)
             grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, g)
             loss_acc = loss_acc + l

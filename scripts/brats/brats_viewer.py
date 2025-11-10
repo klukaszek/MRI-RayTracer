@@ -65,15 +65,40 @@ class BraTSViewer:
         self.surface.configure(width=self.window.width, height=self.window.height)
         self.ui = spy.ui.Context(self.device)
 
+        # Load main entry point only (overlay path removed)
         program = self.device.load_program(str(Path(__file__).parent / "brats_rt.slang"), ["brats_main"])
         self.kernel = self.device.create_compute_kernel(program)
+        # Load precompute kernel if present
+        try:
+            program_pre = self.device.load_program(str(Path(__file__).parent / "brats_rt.slang"), ["inr_precompute"])
+            self.kernel_inr_pre = self.device.create_compute_kernel(program_pre)
+        except Exception:
+            self.kernel_inr_pre = None
+        self.kernel_inr = None
 
         self.output_texture: Optional[spy.Texture] = None
+        self.inr_overlay_tex: Optional[spy.Texture] = None  # unused in simplified path
+        self.inr_volume_tex: Optional[spy.Texture] = None   # 3D precomputed INR probabilities
         self.buffers: Dict[str, spy.Buffer] = {}
         self.seg_buffer: Optional[spy.Buffer] = None
         self.vol_dims: Optional[np.ndarray] = None
         self.voxel_size: Optional[np.ndarray] = None
         self.vol_min: Optional[np.ndarray] = None
+        # INR (implicit network) weights and toggle
+        self.inr_weights: Dict[str, spy.Buffer] = {}
+        self.show_inr: bool = False
+        # INR dynamic dims (deduced from NPZ)
+        self.inr_in_dim: int = 0
+        self.inr_h0: int = 0
+        self.inr_h1: int = 0
+        self.inr_h2: int = 0
+        self.inr_h3: int = 0
+        self.inr_out_dim: int = 0
+        self.inr_kff: int = 0  # fourier features per-axis
+        self.inr_alpha: float = 0.4
+        self.inr_stride: int = 4
+        # Min intensity threshold for INR evaluation
+        self.inr_min_intensity: float = 0.05
 
         # Camera
         up_map = {
@@ -146,7 +171,7 @@ class BraTSViewer:
 
     def _init_ui(self):
         screen = self.ui.screen
-        window = spy.ui.Window(screen, "BraTS Settings", size=spy.float2(460, 420))
+        window = spy.ui.Window(screen, "BraTS Settings", size=spy.float2(480, 500))
 
         # Volume group
         self.volume_group = spy.ui.Group(window, "Volume")
@@ -189,6 +214,19 @@ class BraTSViewer:
         # Ground truth segmentation overlay controls
         self.seg_check = spy.ui.CheckBox(self.seg_group, "Show Ground Truth", value=self.show_seg)
         self.seg_gray = spy.ui.CheckBox(self.seg_group, "Greyscale Ground Truth", value=self.use_grayscale_seg)
+        # INR overlay controls
+        self.inr_check = spy.ui.CheckBox(self.seg_group, "Show INR Prediction", value=self.show_inr)
+        spy.ui.Button(self.seg_group, "Load INR Weights", callback=self.on_click_load_inr)
+        # INR probability mask controls
+        try:
+            self.inr_alpha_slider = spy.ui.SliderFloat(self.seg_group, "INR Alpha", value=self.inr_alpha, min=0.0, max=1.0)
+        except Exception:
+            self.inr_alpha_slider = spy.ui.SliderFloat(self.seg_group, "INR Alpha", min=0.0, max=1.0, value=self.inr_alpha)
+        try:
+            # Expanded stride range to allow coarser base sampling.
+            self.inr_stride_slider = spy.ui.SliderFloat(self.seg_group, "INR Stride (steps)", value=float(self.inr_stride), min=1.0, max=64.0)
+        except Exception:
+            self.inr_stride_slider = spy.ui.SliderFloat(self.seg_group, "INR Stride (steps)", min=1.0, max=64.0, value=float(self.inr_stride))
         spy.ui.Text(window, "Orbit: LMB | Pan: Shift+LMB | Zoom: Wheel")
 
     def _create_float_buffer(self, linear: np.ndarray):
@@ -335,6 +373,153 @@ class BraTSViewer:
 
         # Frame
         self.frame_volume()
+        # Create persistent tiny fallback buffers (avoid per-frame allocations)
+        try:
+            self._empty_float = self._create_float_buffer(np.zeros((1,), dtype=np.float32))
+            self._empty_uint = self._create_uint_buffer(np.zeros((1,), dtype=np.uint32))
+        except Exception:
+            # Fallback if device not ready; will lazy-create on first use
+            self._empty_float = None
+            self._empty_uint = None
+
+    def _create_weight_buffer(self, arr: np.ndarray) -> spy.Buffer:
+        arr = np.ascontiguousarray(arr.astype(np.float32).reshape(-1))
+        buf = self._create_float_buffer(arr)
+        buf.copy_from_numpy(arr)
+        return buf
+
+    def on_click_load_inr(self):
+        # Load INR .npz (expects W_0..W_4 and b_0..b_4)
+        try:
+            path = spy.platform.open_file_dialog()
+        except Exception:
+            path = str((Path(__file__).parent.parent.parent / "artifacts" / "inr_brats23.npz").resolve())
+        if not path:
+            return
+        p = Path(path)
+        if not p.exists() or p.suffix.lower() != ".npz":
+            self.info.text = f"Not an .npz file: {p.name}"
+            return
+        d = np.load(p)
+        keys = [f"W_{i}" for i in range(5)] + [f"b_{i}" for i in range(5)]
+        if not all(k in d for k in keys):
+            self.info.text = f"Missing expected keys in {p.name}"
+            return
+        # Upload
+        self.inr_weights.clear()
+        for k in keys:
+            arr = np.ascontiguousarray(d[k].astype(np.float32))
+            self.inr_weights[k] = self._create_weight_buffer(arr)
+        # Infer dims from weight shapes; expect row-major (in,out)
+        try:
+            w0 = d["W_0"]; b0 = d["b_0"]
+            w1 = d["W_1"]; b1 = d["b_1"]
+            w2 = d["W_2"]; b2 = d["b_2"]
+            w3 = d["W_3"]; b3 = d["b_3"]
+            w4 = d["W_4"]; b4 = d["b_4"]
+            in0, h0 = int(w0.shape[0]), int(w0.shape[1])
+            h0b = int(b0.shape[0])
+            h1in, h1 = int(w1.shape[0]), int(w1.shape[1])
+            h2in, h2 = int(w2.shape[0]), int(w2.shape[1])
+            h3in, h3 = int(w3.shape[0]), int(w3.shape[1])
+            h4in, outd = int(w4.shape[0]), int(w4.shape[1])
+            # Basic consistency checks
+            if not (h0 == h0b == h1in and h1 == int(b1.shape[0]) == h2in and h2 == int(b2.shape[0]) == h3in and h3 == int(b3.shape[0]) == h4in and outd == int(b4.shape[0])):
+                self.info.text = f"INR dims inconsistent in {p.name}"
+            # Deduce K_FF from input dim: in0 = 3 + 3*2*Kff + 4
+            kff_num = in0 - (3 + 4)
+            kff = 0
+            if kff_num % 6 == 0 and kff_num >= 0:
+                kff = kff_num // 6
+            self.inr_in_dim = in0
+            self.inr_h0, self.inr_h1, self.inr_h2, self.inr_h3 = h0, h1, h2, h3
+            self.inr_out_dim = outd
+            self.inr_kff = int(kff)
+        except Exception as e:
+            # If anything goes wrong, keep dims zeroed to disable INR path
+            self.inr_in_dim = self.inr_h0 = self.inr_h1 = self.inr_h2 = self.inr_h3 = self.inr_out_dim = self.inr_kff = 0
+            self.info.text = f"Loaded INR but failed to parse dims: {e}"
+        # Do not auto-enable INR overlay on load to avoid sudden GPU cost
+        self.show_inr = False
+        try:
+            self.inr_check.value = False
+        except Exception:
+            pass
+        self.info.text = self.info.text + f"\nINR loaded: {p.name} (in={self.inr_in_dim}, h=({self.inr_h0},{self.inr_h1},{self.inr_h2},{self.inr_h3}), out={self.inr_out_dim}, kff={self.inr_kff})"
+        # Precompute INR volume if kernel available and dims reasonable
+        if self.kernel_inr_pre is not None and self.vol_dims is not None and self.inr_out_dim > 0:
+            try:
+                dx, dy, dz = map(int, self.vol_dims.tolist())
+                # Allocate or reallocate 3D texture
+                self.inr_volume_tex = self.device.create_texture(
+                    format=spy.Format.rgba16_float,
+                    width=dx,
+                    height=dy,
+                    depth=dz,
+                    usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
+                    label="inr_volume"
+                )
+                self.kernel_inr_pre.dispatch(
+                    thread_count=[dx, dy, dz],
+                    vars={
+                        "gIntensity0": self.inr_weights and self.buffers.get("T1n", self._empty_float) or self._empty_float,
+                        "gIntensity1": self.buffers.get("T1c", self._empty_float),
+                        "gIntensity2": self.buffers.get("T2w", self._empty_float),
+                        "gIntensity3": self.buffers.get("FLAIR", self._empty_float),
+                        "gW0": self.inr_weights.get("W_0", self._empty_float),
+                        "gB0": self.inr_weights.get("b_0", self._empty_float),
+                        "gW1": self.inr_weights.get("W_1", self._empty_float),
+                        "gB1": self.inr_weights.get("b_1", self._empty_float),
+                        "gW2": self.inr_weights.get("W_2", self._empty_float),
+                        "gB2": self.inr_weights.get("b_2", self._empty_float),
+                        "gW3": self.inr_weights.get("W_3", self._empty_float),
+                        "gB3": self.inr_weights.get("b_3", self._empty_float),
+                        "gW4": self.inr_weights.get("W_4", self._empty_float),
+                        "gB4": self.inr_weights.get("b_4", self._empty_float),
+                        "gINRVolumeOut": self.inr_volume_tex,
+                        "gParams": {
+                            "imageSize": (np.uint32(1), np.uint32(1)),
+                            "fovY": np.float32(1.0),
+                            "eye": np.array([0,0,0], dtype=np.float32),
+                            "U": np.array([1,0,0], dtype=np.float32),
+                            "V": np.array([0,1,0], dtype=np.float32),
+                            "W": np.array([0,0,1], dtype=np.float32),
+                            "volMin": (self.vol_min.astype(np.float32) if isinstance(self.vol_min, np.ndarray) else np.array([0,0,0], dtype=np.float32)),
+                            "voxelSize": (self.voxel_size.astype(np.float32) if isinstance(self.voxel_size, np.ndarray) else np.array([1,1,1], dtype=np.float32)),
+                            "dims": self.vol_dims.astype(np.uint32),
+                            "stepSize": np.float32(1.0),
+                            "nearT": np.float32(0.0),
+                            "farT": np.float32(0.0),
+                            "bgColor": np.array([0,0,0], dtype=np.float32),
+                            "volEnabled": (np.uint32(1), np.uint32(1), np.uint32(1), np.uint32(1)),
+                            "volWeight": (np.float32(1.0), np.float32(1.0), np.float32(1.0), np.float32(1.0)),
+                            "ww": np.float32(self.ww),
+                            "wl": np.float32(self.wl),
+                            "intensityAlpha": np.float32(self.intensity_alpha),
+                            "gamma": np.float32(self.gamma),
+                            "gradBoost": np.float32(0.0),
+                            "gradScale": np.float32(0.0),
+                            "showSeg": np.uint32(0),
+                            "showINR": np.uint32(0),
+                            "inrKFF": np.uint32(self.inr_kff),
+                            "inrInDim": np.uint32(self.inr_in_dim),
+                            "inrH0": np.uint32(self.inr_h0),
+                            "inrH1": np.uint32(self.inr_h1),
+                            "inrH2": np.uint32(self.inr_h2),
+                            "inrH3": np.uint32(self.inr_h3),
+                            "inrOutDim": np.uint32(self.inr_out_dim),
+                            "inrAlpha": np.float32(self.inr_alpha),
+                            "inrStepStride": np.uint32(1),
+                            "inrMinIntensity": np.float32(0.0),
+                            "inrOverlayWidth": np.uint32(0),
+                            "inrOverlayHeight": np.uint32(0),
+                            "precomputedINR": np.uint32(1),
+                        },
+                    }
+                )
+                self.info.text += "\nPrecomputed INR volume generated"
+            except Exception as e:
+                self.info.text += f"\nINR precompute failed: {e}"
 
     def on_click_load_file(self):
         # Let user pick a NIfTI file; then load all .nii/.nii.gz in its directory
@@ -488,6 +673,8 @@ class BraTSViewer:
                     usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
                     label="brats_output",
                 )
+                # Invalidate INR overlay on resize
+                self.inr_overlay_tex = None
 
             # Update settings from UI
             self.fov_deg = float(self.fov_slider.value)
@@ -514,9 +701,17 @@ class BraTSViewer:
             try:
                 self.show_seg = bool(self.seg_check.value)
                 self.use_grayscale_seg = bool(self.seg_gray.value)
+                self.show_inr = bool(self.inr_check.value)
+                self.inr_alpha = float(self.inr_alpha_slider.value)
+                # Treat stride slider as integer in [1, 64]
+                self.inr_stride = max(1, min(64, int(round(float(self.inr_stride_slider.value)))))
+                # Screen-space stride
+                if hasattr(self, 'inr_screen_stride_slider'):
+                    self.inr_screen_stride = max(1, min(128, int(round(float(self.inr_screen_stride_slider.value)))))
             except Exception:
                 self.show_seg = bool(getattr(self.seg_check, 'checked', True))
                 self.use_grayscale_seg = bool(getattr(self.seg_gray, 'checked', False))
+                self.show_inr = bool(getattr(self, 'show_inr', False))
 
             # Camera basis
             eye, gU, gV, gW = self.camera.get_basis()
@@ -556,28 +751,108 @@ class BraTSViewer:
                 "gradBoost": np.float32(self.grad_boost),
                 "gradScale": np.float32(self.grad_scale),
                 "showSeg": np.uint32(1 if (self.show_seg and self.seg_buffer is not None) else 0),
+                "showINR": np.uint32(1 if (self.show_inr and len(self.inr_weights) == 10 and self.inr_out_dim > 0) else 0),
+                # INR dims and controls
+                "inrKFF": np.uint32(max(0, self.inr_kff)),
+                "inrInDim": np.uint32(max(0, self.inr_in_dim)),
+                "inrH0": np.uint32(max(0, self.inr_h0)),
+                "inrH1": np.uint32(max(0, self.inr_h1)),
+                "inrH2": np.uint32(max(0, self.inr_h2)),
+                "inrH3": np.uint32(max(0, self.inr_h3)),
+                "inrOutDim": np.uint32(max(0, self.inr_out_dim)),
+                "inrAlpha": np.float32(self.inr_alpha),
+                "inrStepStride": np.uint32(max(1, self.inr_stride)),
+                "inrMinIntensity": np.float32(0.05),
+                # Prefer differentiable INR overlay pipeline in shader
+                "useDiffINR": np.uint32(1),
                 "lutColorAlpha": [tuple(map(float, row)) for row in lut_use.tolist()],
+                "precomputedINR": np.uint32(1 if (self.inr_volume_tex is not None) else 0),
             }
 
             ce = self.device.create_command_encoder()
+
+            # Ensure INR overlay texture exists when INR is enabled
+            inr_enabled = bool(params["showINR"]) and (self.kernel_inr is not None)
+            if inr_enabled:
+                ow = max(1, int(math.ceil(self.output_texture.width / max(1, self.inr_screen_stride))))
+                oh = max(1, int(math.ceil(self.output_texture.height / max(1, self.inr_screen_stride))))
+                if (self.inr_overlay_tex is None or self.inr_overlay_tex.width != ow or self.inr_overlay_tex.height != oh):
+                    self.inr_overlay_tex = self.device.create_texture(
+                        format=spy.Format.rgba16_float,
+                        width=ow,
+                        height=oh,
+                        usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
+                        label="inr_overlay",
+                    )
+                # Dispatch overlay generator (one thread per overlay pixel)
+                if self.kernel_inr is not None:
+                    try:
+                        self.kernel_inr.dispatch(
+                            thread_count=[self.inr_overlay_tex.width, self.inr_overlay_tex.height, 1],
+                            vars={
+                                "gIntensity0": _buf_or_empty("T1n"),
+                                "gIntensity1": _buf_or_empty("T1c"),
+                                "gIntensity2": _buf_or_empty("T2w"),
+                                "gIntensity3": _buf_or_empty("FLAIR"),
+                                "gLabels": (self.seg_buffer if self.seg_buffer is not None else (self._empty_uint if getattr(self, "_empty_uint", None) is not None else self._create_uint_buffer(np.zeros((1,), dtype=np.uint32)))),
+                                "gW0": (self.inr_weights.get("W_0") if inr_enabled else self._empty_float),
+                                "gB0": (self.inr_weights.get("b_0") if inr_enabled else self._empty_float),
+                                "gW1": (self.inr_weights.get("W_1") if inr_enabled else self._empty_float),
+                                "gB1": (self.inr_weights.get("b_1") if inr_enabled else self._empty_float),
+                                "gW2": (self.inr_weights.get("W_2") if inr_enabled else self._empty_float),
+                                "gB2": (self.inr_weights.get("b_2") if inr_enabled else self._empty_float),
+                                "gW3": (self.inr_weights.get("W_3") if inr_enabled else self._empty_float),
+                                "gB3": (self.inr_weights.get("b_3") if inr_enabled else self._empty_float),
+                                "gW4": (self.inr_weights.get("W_4") if inr_enabled else self._empty_float),
+                                "gB4": (self.inr_weights.get("b_4") if inr_enabled else self._empty_float),
+                                "gINROverlay": self.inr_overlay_tex,
+                                "gINROverlayRW": self.inr_overlay_tex,
+                                "gParams": {
+                                    **params,
+                                    "inrOverlayWidth": np.uint32(self.inr_overlay_tex.width),
+                                    "inrOverlayHeight": np.uint32(self.inr_overlay_tex.height),
+                                },
+                            },
+                            command_encoder=ce,
+                        )
+                    except Exception:
+                        pass
             # Bind buffers; fall back to small buffer if missing
             def _buf_or_empty(key: str) -> spy.Buffer:
                 if key in self.buffers and self.buffers[key] is not None:
                     return self.buffers[key]
                 # create small empty once
-                one = np.zeros((1,), dtype=np.float32)
-                return self._create_float_buffer(one)
+                if getattr(self, "_empty_float", None) is None:
+                    self._empty_float = self._create_float_buffer(np.zeros((1,), dtype=np.float32))
+                return self._empty_float
 
             self.kernel.dispatch(
                 thread_count=[self.output_texture.width, self.output_texture.height, 1],
                 vars={
                     "gOutput": self.output_texture,
+                    "gINROverlay": (self.inr_overlay_tex if (inr_enabled and self.inr_overlay_tex is not None) else self.output_texture),
                     "gIntensity0": _buf_or_empty("T1n"),
                     "gIntensity1": _buf_or_empty("T1c"),
                     "gIntensity2": _buf_or_empty("T2w"),
                     "gIntensity3": _buf_or_empty("FLAIR"),
-                    "gLabels": (self.seg_buffer if self.seg_buffer is not None else self._create_uint_buffer(np.zeros((1,), dtype=np.uint32))),
-                    "gParams": params,
+                    "gLabels": (self.seg_buffer if self.seg_buffer is not None else (self._empty_uint if getattr(self, "_empty_uint", None) is not None else self._create_uint_buffer(np.zeros((1,), dtype=np.uint32)))),
+                    # Bind INR buffers only when overlay is active
+                    "gW0": (self.inr_weights.get("W_0") if params["showINR"] else self._empty_float),
+                    "gB0": (self.inr_weights.get("b_0") if params["showINR"] else self._empty_float),
+                    "gW1": (self.inr_weights.get("W_1") if params["showINR"] else self._empty_float),
+                    "gB1": (self.inr_weights.get("b_1") if params["showINR"] else self._empty_float),
+                    "gW2": (self.inr_weights.get("W_2") if params["showINR"] else self._empty_float),
+                    "gB2": (self.inr_weights.get("b_2") if params["showINR"] else self._empty_float),
+                    "gW3": (self.inr_weights.get("W_3") if params["showINR"] else self._empty_float),
+                    "gB3": (self.inr_weights.get("b_3") if params["showINR"] else self._empty_float),
+                    "gW4": (self.inr_weights.get("W_4") if params["showINR"] else self._empty_float),
+                    "gB4": (self.inr_weights.get("b_4") if params["showINR"] else self._empty_float),
+                    "gINRVolume": (self.inr_volume_tex if self.inr_volume_tex is not None else self.output_texture),
+                    "gParams": {
+                        **params,
+                        "inrOverlayWidth": np.uint32(self.inr_overlay_tex.width if (inr_enabled and self.inr_overlay_tex is not None) else 0),
+                        "inrOverlayHeight": np.uint32(self.inr_overlay_tex.height if (inr_enabled and self.inr_overlay_tex is not None) else 0),
+                    },
                 },
                 command_encoder=ce,
             )
