@@ -22,6 +22,8 @@ dependencies = [
     "nnunetv2>=2.6.2",
     "hiddenlayer>=0.3",
     "optax>=0.2.6",
+    "flax>=0.12.0",
+    "wandb>=0.23.0",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +35,7 @@ cu128 = [
   "torch>=2.7.0",
   "torchvision>=0.22.0",
 ]
+ac = []  # Empty extra to trigger Alliance Canada indices
 
 [tool.uv]
 conflicts = [
@@ -41,6 +44,10 @@ conflicts = [
     { extra = "cu128" },
   ],
 ]
+
+[tool.uv.pip]
+# Only use unsafe-first-match when ac extra is enabled
+index-strategy = "unsafe-first-match"
 
 [tool.uv.sources]
 torch = [
@@ -52,6 +59,39 @@ torchvision = [
   { index = "pytorch-cu128", extra = "cu128" },
 ]
 
+# Alliance Canada indices - will be used when --extra ac is specified
+[[tool.uv.index]]
+name = "computecanada-gentoo2020-avx2"
+url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2020/avx2"
+format = "flat"
+
+[[tool.uv.index]]
+name = "computecanada-gentoo2020-generic"
+url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2020/generic"
+format = "flat"
+
+[[tool.uv.index]]
+name = "computecanada-gentoo-avx2"
+url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo/avx2"
+format = "flat"
+
+[[tool.uv.index]]
+name = "computecanada-gentoo-generic"
+url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo/generic"
+format = "flat"
+
+[[tool.uv.index]]
+name = "computecanada-generic"
+url = "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/generic"
+format = "flat"
+
+# PyPI indices
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+# PyTorch-specific indices (explicit = true means they're only used when explicitly referenced)
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"

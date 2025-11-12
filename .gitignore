@@ -16,3 +16,4 @@ data/
 **.nii.gz
 .DS_Store
 site/
+notebooks/wandb/*
