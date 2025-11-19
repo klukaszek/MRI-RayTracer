@@ -17,3 +17,7 @@ data/
 .DS_Store
 site/
 notebooks/wandb/*
+.julia
+checkpoints/
+artifacts/
+**wandb*
