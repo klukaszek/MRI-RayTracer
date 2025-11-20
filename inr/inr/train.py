@@ -80,9 +80,9 @@ def train_inr(config: Dict[str, Any], use_wandb: bool = True, resume_from: str |
             tags=config.get("WANDB_TAGS"),
             notes=config.get("WANDB_NOTES"),
         )
-        save_path = pathlib.Path(f"../artifacts/brats-inr-segmentation/{run.name}/")
+        save_path = pathlib.Path(f"./artifacts/brats-inr-segmentation/{run.name}/")
     else:
-        save_path = pathlib.Path("../artifacts/brats-inr-segmentation/offline/")
+        save_path = pathlib.Path("./artifacts/brats-inr-segmentation/offline/")
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     save_path.mkdir(parents=True, exist_ok=True)

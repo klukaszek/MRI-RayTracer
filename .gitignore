@@ -21,3 +21,5 @@ notebooks/wandb/*
 checkpoints/
 artifacts/
 **wandb*
+notebooks/
+scripts/

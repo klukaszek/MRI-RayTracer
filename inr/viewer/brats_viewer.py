@@ -2,29 +2,39 @@ from __future__ import annotations
 
 import argparse
 import math
-import json
-import sys as _sys
+import sys
 from pathlib import Path
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import nibabel as nib
 import slangpy as spy
 
-# Try importing JAX for inference
+from camera import OrbitalCamera 
+
+# --- Path Setup for Imports ---
+# Assuming structure:
+#   root/
+#    inr/
+#     model.py
+#     ...
+#    viewer/
+#      brats_viewer.py
+#      ...
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+# Try resolving project root (up 2 levels from scripts/brats)
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
+
 try:
-    import jax
-    import jax.numpy as jnp
+    import inr.model as inr_model
     HAS_JAX = True
-except ImportError:
+except ImportError as e:
+    print(f"Warning: Could not import 'inr.model'. Inference disabled. Error: {e}")
     HAS_JAX = False
-    print("Warning: JAX not found. INR inference will be disabled.")
-
-# Reuse the VDB viewer orbital camera
-_HERE = Path(__file__).parent
-_sys.path.append((_HERE / "vdb_viewer").as_posix())
-from camera import OrbitalCamera  # type: ignore
-
 
 MOD_SUFFIXES = {
     "t1n": "T1n",
@@ -33,91 +43,11 @@ MOD_SUFFIXES = {
     "t2f": "FLAIR",
 }
 
-# -----------------------------------------------------------------------------
-# JAX Inference Utils
-# -----------------------------------------------------------------------------
-
-def fourier_features(coords: Any, k: int) -> Any:
-    if not HAS_JAX: return None
-    B, dim = coords.shape
-    freqs = jnp.arange(1, k + 1, dtype=jnp.float32)
-    ang = coords[..., None] * freqs[None, None, :] * math.pi
-    sin = jnp.sin(ang)
-    cos = jnp.cos(ang)
-    ff = jnp.concatenate([sin, cos], axis=-1).reshape(B, dim * 2 * k)
-    return ff
-
-def build_input(coords: Any, intensities: Any, fourier_freqs: int) -> Any:
-    ff = fourier_features(coords, fourier_freqs)
-    return jnp.concatenate([coords, ff, intensities], axis=-1)
-
-def apply_mlp(params: Any, x: Any) -> Any:
-    layers = params if isinstance(params, list) else []
-    if not layers and isinstance(params, dict):
-        import re
-        def nk(s): return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', str(s))]
-        keys = sorted(params.keys(), key=nk)
-        for k in keys:
-            layers.append(params[k])
-            
-    *hidden, last = layers
-    h = x
-    for layer in hidden:
-        w = layer['W'] if isinstance(layer, dict) else layer.W
-        b = layer['b'] if isinstance(layer, dict) else layer.b
-        h = jnp.dot(h, w) + b
-        h = jax.nn.relu(h)
-    
-    w_last = last['W'] if isinstance(last, dict) else last.W
-    b_last = last['b'] if isinstance(last, dict) else last.b
-    out = jnp.dot(h, w_last) + b_last
-    return out
-
-def predict_chunk(params, coords_chunk, intens_chunk, fourier_freqs):
-    x_in = build_input(coords_chunk, intens_chunk, fourier_freqs)
-    logits = apply_mlp(params, x_in)
-    return jnp.argmax(logits, axis=-1).astype(jnp.int16)
-
-_predict_chunk_jit = None
-
-def run_inference_on_volume(params, mods_np: np.ndarray, fourier_freqs: int, chunk_size: int = 500000) -> np.ndarray:
-    global _predict_chunk_jit
-    if _predict_chunk_jit is None and HAS_JAX:
-        _predict_chunk_jit = jax.jit(predict_chunk, static_argnames=['fourier_freqs'])
-
-    M, H, W, D = mods_np.shape
-    xs = np.arange(H)
-    ys = np.arange(W)
-    zs = np.arange(D)
-    grid = np.stack(np.meshgrid(xs, ys, zs, indexing='ij'), axis=-1).reshape(-1, 3)
-    
-    scale = np.array([H - 1, W - 1, D - 1], dtype=np.float32)
-    norm_coords = (grid / scale) * 2.0 - 1.0
-    
-    intens = mods_np.transpose(1, 2, 3, 0).reshape(-1, M)
-    
-    total_voxels = len(grid)
-    preds = []
-    print(f"Starting inference on {total_voxels} voxels...")
-    
-    for i in range(0, total_voxels, chunk_size):
-        end = min(i + chunk_size, total_voxels)
-        c_c = jnp.array(norm_coords[i:end])
-        i_c = jnp.array(intens[i:end])
-        p_c = _predict_chunk_jit(params, c_c, i_c, fourier_freqs=fourier_freqs)
-        preds.append(np.array(p_c))
-        
-    print("Inference complete. Assembling volume.")
-    pred_flat = np.concatenate(preds, axis=0)
-    return pred_flat.reshape(H, W, D).astype(np.uint8)
-
-# -----------------------------------------------------------------------------
-# Loaders
-# -----------------------------------------------------------------------------
-
 def load_nifti_float(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     img = nib.load(path.as_posix())
     data = img.get_fdata(dtype=np.float32)
+    
+    # --- Visualization Normalization [0, 1] ---
     vmin = float(np.percentile(data, 1.0))
     vmax = float(np.percentile(data, 99.5))
     if vmax <= vmin:
@@ -125,9 +55,12 @@ def load_nifti_float(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
         vmin = float(np.min(data))
     rng = max(1e-6, vmax - vmin)
     norm = np.clip((data - vmin) / rng, 0.0, 1.0).astype(np.float32)
+    
     hdr = img.header
     zooms = np.array(hdr.get_zooms()[:3], dtype=np.float32)
     dimx, dimy, dimz = norm.shape
+    
+    # Flatten to linear buffer (Z-major scanline to match shader)
     linear = np.ascontiguousarray(norm.transpose(2, 1, 0).reshape(-1))
     return linear, norm, np.array([dimx, dimy, dimz], dtype=np.uint32), zooms
 
@@ -154,17 +87,19 @@ class BraTSViewer:
 
         self.output_texture: Optional[spy.Texture] = None
         self.buffers: Dict[str, spy.Buffer] = {}
-        self.loaded_volumes: Dict[str, np.ndarray] = {}
+        self.raw_volumes: Dict[str, np.ndarray] = {} # Store RAW float32 for inference
+        
         self.seg_buffer: Optional[spy.Buffer] = None
         self.pred_buffer: Optional[spy.Buffer] = None
+        
         self.vol_dims: Optional[np.ndarray] = None
         self.voxel_size: Optional[np.ndarray] = None
         self.vol_min: Optional[np.ndarray] = None
         
         self.show_seg = True
         self.show_pred = False
-        self.use_grayscale_seg = False
         
+        # Camera Setup
         up_map = {
             "X": np.array([1.0, 0.0, 0.0], dtype=np.float32),
             "Y": np.array([0.0, 1.0, 0.0], dtype=np.float32),
@@ -177,6 +112,14 @@ class BraTSViewer:
         self.fov_deg = 70.0
         self.camera = OrbitalCamera(initial_radius=3.0, world_up=world_up)
         self.camera.set_fov_degrees(self.fov_deg)
+
+        # Interaction State
+        self.pan_speed = 0.2
+        self._lmb = False
+        self._is_dragging = False
+        self._press_pos = None
+        self._last = None
+        self._drag_threshold = 5.0 # Pixels deadzone
 
         self.enabled = {k: True for k in MOD_SUFFIXES.values()}
         self.weights = {k: 1.0 for k in MOD_SUFFIXES.values()}
@@ -191,11 +134,13 @@ class BraTSViewer:
         self.step_size = 0.05
         self.bg_color = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         
+        # Fixed LUT for classes 0, 1, 2, 3
         self.lut = np.zeros((8, 4), dtype=np.float32)
         self.lut[0] = [0.0, 0.0, 0.0, 0.0]
-        self.lut[1] = [0.0, 0.4, 1.0, 0.9] 
-        self.lut[2] = [0.0, 0.8, 0.0, 0.7] 
-        self.lut[4] = [1.0, 0.1, 0.1, 0.9]
+        self.lut[1] = [0.0, 0.4, 1.0, 0.9] # NCR/NET
+        self.lut[2] = [0.0, 0.8, 0.0, 0.7] # Edema
+        self.lut[3] = [1.0, 0.1, 0.1, 0.9] # Enhancing
+        self.lut[4] = [1.0, 0.1, 0.1, 0.9] # Backup
         self.lut = np.ascontiguousarray(self.lut, dtype=np.float32)
 
         self._init_ui()
@@ -204,12 +149,6 @@ class BraTSViewer:
         self.window.on_mouse_event = self.on_mouse
         self.window.on_keyboard_event = self.on_keyboard
         self.window.on_resize = self.on_resize
-        self.pan_speed = 0.2
-        self._lmb = False
-        self._orbit_dragging = False
-        self._pan_dragging = False
-        self._last = None
-        self._press_pos = None
 
     def _init_ui(self):
         screen = self.ui.screen
@@ -263,28 +202,29 @@ class BraTSViewer:
             raise RuntimeError("No modality volumes found.")
 
         first_key = next(iter(mod_files))
-        lin0, vol0, dims, vox = load_nifti_float(mod_files[first_key])
+        lin0, raw0, dims, vox = load_nifti_float(mod_files[first_key])
         self.vol_dims = dims.astype(np.uint32)
         max_dim = float(max(dims))
         scale = np.float32(1.8 / max_dim)
         self.voxel_size = (vox * scale).astype(np.float32)
         self.vol_min = -0.5 * (self.voxel_size * self.vol_dims.astype(np.float32))
 
-        self.loaded_volumes = {}
+        self.raw_volumes = {}
         
         empty = np.zeros(1, dtype=np.float32)
         self.buffers = {k: self._create_float_buffer(empty) for k in MOD_SUFFIXES.values()}
         
-        self.loaded_volumes[first_key] = vol0
+        # Process first
+        self.raw_volumes[first_key] = raw0
         buf0 = self._create_float_buffer(lin0)
         buf0.copy_from_numpy(lin0)
         self.buffers[first_key] = buf0
         
         for key, path in mod_files.items():
             if key == first_key: continue
-            lin, vol, d2, _ = load_nifti_float(path)
+            lin, raw, d2, _ = load_nifti_float(path)
             if not np.all(d2 == dims): raise RuntimeError("Dim mismatch")
-            self.loaded_volumes[key] = vol
+            self.raw_volumes[key] = raw
             b = self._create_float_buffer(lin)
             b.copy_from_numpy(lin)
             self.buffers[key] = b
@@ -317,41 +257,43 @@ class BraTSViewer:
         if not path: return
         p = Path(path)
         
-        json_path = p.with_name(f"{p.stem}_info.json")
-        if not json_path.exists():
-            parts = p.stem.split('_step')
-            if len(parts) > 1:
-                json_path = p.with_name(f"{parts[0]}_info.json")
-        
-        if not json_path.exists():
-            self.info.text = "Config JSON not found."
-            return
-            
         try:
-            with open(json_path, 'r') as f:
-                config = json.load(f)
-            fourier_freqs = config.get("fourier_freqs", 10)
+            params, config_raw = inr_model.model_load(p)
+            train_config = config_raw.get('config', config_raw)
             
-            npz = np.load(p, allow_pickle=True)
-            if 'params' in npz:
-                arr = npz['params']
-                params = arr.item() if arr.ndim==0 else arr
-            else:
-                params = {k: npz[k] for k in npz.files}
+            fourier_freqs = 10
+            if 'FOURIER_FREQS' in train_config:
+                fourier_freqs = int(train_config['FOURIER_FREQS'])
+            elif 'fourier_freqs' in train_config:
+                fourier_freqs = int(train_config['fourier_freqs'])
             
-            self.info.text = "Running Inference..."
+            self.info.text = f"Inference (K={fourier_freqs})..."
             self.window.process_events() 
             
-            req_keys = ["T1n", "T2w", "FLAIR", "T1c"]
-            if not all(k in self.loaded_volumes for k in req_keys):
+            req_keys = ["T1n", "T1c", "T2w", "FLAIR"]
+            if not all(k in self.raw_volumes for k in req_keys):
                 self.info.text = "Missing required modalities."
                 return
             
-            stack_list = [self.loaded_volumes[k] for k in req_keys]
-            mods_np = np.stack(stack_list, axis=0) 
+            # --- PREPROCESSING (Correct Z-Score Normalization) ---
+            processed_mods = []
+            for k in req_keys:
+                arr = self.raw_volumes[k] # float32 raw data
+                mask = arr != 0
+                if mask.any():
+                    mu = arr[mask].mean()
+                    sigma = arr[mask].std() + 1e-6
+                    arr = (arr - mu) / sigma
+                processed_mods.append(arr)
             
-            pred_vol = run_inference_on_volume(params, mods_np, fourier_freqs=fourier_freqs)
+            mods_np = np.stack(processed_mods, axis=0) # (4, H, W, D)
             
+            # Run Inference
+            case_data = {"mods": mods_np, "seg": None}
+            pred_vol, _ = inr_model.predict_volume(params, case_data, fourier_freqs=fourier_freqs)
+            
+            # Upload to GPU
+            # Flatten Z-major to match shader layout
             pred_linear = np.ascontiguousarray(pred_vol.transpose(2, 1, 0).reshape(-1))
             self.pred_buffer = self._create_uint_buffer(pred_linear.astype(np.uint32))
             self.pred_buffer.copy_from_numpy(pred_linear.astype(np.uint32))
@@ -360,7 +302,7 @@ class BraTSViewer:
             try: self.pred_check.value = True
             except: pass
             
-            self.info.text = "Inference Done & Loaded."
+            self.info.text = "Inference Done."
             
         except Exception as e:
             import traceback
@@ -383,14 +325,42 @@ class BraTSViewer:
 
     def on_mouse(self, event):
         if self.ui.handle_mouse_event(event): return
-        if event.type == spy.MouseEventType.button_down: self._lmb = True; self._last = event.pos
-        elif event.type == spy.MouseEventType.button_up: self._lmb = False
+        
+        if event.type == spy.MouseEventType.button_down:
+            if event.button == spy.MouseButton.left:
+                self._lmb = True
+                self._press_pos = event.pos
+                self._last = event.pos
+                self._is_dragging = False
+                
+        elif event.type == spy.MouseEventType.button_up:
+            if event.button == spy.MouseButton.left:
+                self._lmb = False
+                self._is_dragging = False
+
         elif event.type == spy.MouseEventType.move and self._lmb:
-            dx, dy = event.pos.x - self._last.x, event.pos.y - self._last.y
-            if event.has_modifier(spy.KeyModifier.shift): self.camera.pan(dx*self.pan_speed, dy*self.pan_speed, self.window.height)
-            else: self.camera.orbit(dx*0.01, dy*0.01)
-            self._last = event.pos
-        elif event.is_scroll(): self.camera.zoom(pow(1.1, -event.scroll.y))
+            # Deadzone logic to prevent jumps on click
+            if not self._is_dragging:
+                dx = event.pos.x - self._press_pos.x
+                dy = event.pos.y - self._press_pos.y
+                if (dx*dx + dy*dy) > (self._drag_threshold * self._drag_threshold):
+                    self._is_dragging = True
+                    # Reset last to avoid jump
+                    self._last = event.pos 
+            
+            if self._is_dragging:
+                dx = event.pos.x - self._last.x
+                dy = event.pos.y - self._last.y
+                
+                if event.has_modifier(spy.KeyModifier.shift): 
+                    self.camera.pan(dx * self.pan_speed, dy * self.pan_speed, self.window.height)
+                else: 
+                    self.camera.orbit(dx * 0.01, dy * 0.01)
+                
+                self._last = event.pos
+
+        elif event.is_scroll(): 
+            self.camera.zoom(pow(1.1, -event.scroll.y))
 
     def on_keyboard(self, e): 
         if not self.ui.handle_keyboard_event(e) and e.key == spy.KeyCode.escape: self.window.close()
@@ -461,7 +431,7 @@ class BraTSViewer:
                 command_encoder=ce
             )
             
-            # FIXED: Blit destination is the swapchain image (tex), source is our computed texture
+            # Correct Blit order: dst, src
             ce.blit(tex, self.output_texture)
             
             self.ui.begin_frame(tex.width, tex.height)
@@ -473,6 +443,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dir", type=str)
     p.add_argument("--data_root", type=str, default=str(Path(__file__).parent / "data" / "BraTS-2023"))
+    p.add_argument("--up", type=str, default="Y", help="World up axis: X|Y|Z|-X|-Y|-Z")
     args = p.parse_args()
     case = Path(args.dir) if args.dir else None
     if not case or not case.exists():
@@ -482,4 +453,4 @@ if __name__ == "__main__":
                 if any(d.glob("*.nii.gz")): case = d; break
     
     if not case: raise SystemExit("No case found.")
-    BraTSViewer(case).run()
+    BraTSViewer(case, up=args.up).run()
