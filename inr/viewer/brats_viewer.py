@@ -76,7 +76,7 @@ def load_seg_uint(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 class BraTSViewer:
     def __init__(self, case_dir: Path, up: str = "Y"):
-        self.window = spy.Window(title="BraTS Viewer (Slang) - Offline Inference", resizable=True)
+        self.window = spy.Window(title="Brain Viewer (Slang) - Inference Prepass", resizable=True)
         self.device = spy.Device(enable_debug_layers=True, compiler_options={"include_paths": [Path(__file__).parent]})
         self.surface = self.device.create_surface(self.window)
         self.surface.configure(width=self.window.width, height=self.window.height)
@@ -385,6 +385,16 @@ class BraTSViewer:
             try: 
                 self.show_seg = bool(self.seg_check.value)
                 self.show_pred = bool(self.pred_check.value)
+                
+                # Update Camera / Render Params from UI
+                self.fov_deg = float(self.fov_slider.value)
+                self.camera.set_fov_degrees(self.fov_deg)
+                
+                self.near_t = float(self.near_slider.value)
+                self.far_t = float(self.far_slider.value)
+                
+                for k, cb in self.mod_check.items():
+                    self.enabled[k] = bool(cb.value)
             except: pass
             
             eye, gU, gV, gW = self.camera.get_basis()

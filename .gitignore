@@ -22,4 +22,4 @@ checkpoints/
 artifacts/
 **wandb*
 notebooks/
-scripts/
+# scripts/
